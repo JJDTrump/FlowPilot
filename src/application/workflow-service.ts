@@ -152,10 +152,15 @@ export class WorkflowService {
       await this.repo.saveProgress(data);
       await this.repo.saveTaskContext(id, `# task-${id}: ${task.title}\n\n${detail}\n`);
       await this.updateSummary(data);
-      autoCommit(id, task.title, summaryLine, files);
+      const commitErr = autoCommit(id, task.title, summaryLine, files);
 
       const doneCount = data.tasks.filter(t => t.status === 'done').length;
-      const msg = `任务 ${id} 完成 (${doneCount}/${data.tasks.length}) [已自动提交]`;
+      let msg = `任务 ${id} 完成 (${doneCount}/${data.tasks.length})`;
+      if (commitErr) {
+        msg += `\n[git提交失败] ${commitErr}\n请根据错误修复后手动执行 git add -A && git commit`;
+      } else {
+        msg += ' [已自动提交]';
+      }
       return isAllDone(data.tasks) ? msg + '\n全部任务已完成，请执行 node flow.js finish 进行收尾' : msg;
     } finally {
       await this.repo.unlock();
@@ -271,9 +276,12 @@ export class WorkflowService {
 
     await this.repo.clearAll();
     const titles = done.map(t => `- ${t.id}: ${t.title}`).join('\n');
-    autoCommit('finish', data.name || '工作流完成', `${stats}\n\n${titles}`);
+    const commitErr = autoCommit('finish', data.name || '工作流完成', `${stats}\n\n${titles}`);
 
     const scripts = result.scripts.length ? result.scripts.join(', ') : '无验证脚本';
+    if (commitErr) {
+      return `验证通过: ${scripts}\n${stats}\n[git提交失败] ${commitErr}\n请根据错误修复后手动执行 git add -A && git commit`;
+    }
     return `验证通过: ${scripts}\n${stats}\n已提交最终commit，工作流回到待命状态\n等待下一个需求...`;
   }
 

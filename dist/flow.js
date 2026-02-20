@@ -415,8 +415,9 @@ function commitIn(cwd, files, msg) {
     if (status === "HAS_CHANGES") {
       (0, import_node_child_process.execSync)("git commit -F -", { ...opts, input: msg });
     }
+    return null;
   } catch (e) {
-    console.error(`[FlowPilot] git commit \u5931\u8D25 (${cwd}): ${e.stderr || e.message}`);
+    return `${cwd}: ${e.stderr?.toString?.() || e.message}`;
   }
 }
 function gitCleanup() {
@@ -427,20 +428,24 @@ function gitCleanup() {
   }
 }
 function autoCommit(taskId, title, summary, files) {
-  try {
-    const msg = `task-${taskId}: ${title}
+  const msg = `task-${taskId}: ${title}
 
 ${summary}`;
-    const submodules = getSubmodules();
-    if (!submodules.length) {
-      commitIn(process.cwd(), files?.length ? files : null, msg);
-      return;
-    }
-    if (files?.length) {
-      const groups = groupBySubmodule(files, submodules);
-      for (const [sub, subFiles] of groups) {
-        if (sub) commitIn(sub, subFiles, msg);
+  const errors = [];
+  const submodules = getSubmodules();
+  if (!submodules.length) {
+    const err = commitIn(process.cwd(), files?.length ? files : null, msg);
+    return err;
+  }
+  if (files?.length) {
+    const groups = groupBySubmodule(files, submodules);
+    for (const [sub, subFiles] of groups) {
+      if (sub) {
+        const err = commitIn(sub, subFiles, msg);
+        if (err) errors.push(err);
       }
+    }
+    try {
       const parentFiles = groups.get("") ?? [];
       const touchedSubs = [...groups.keys()].filter((k) => k !== "");
       for (const s of touchedSubs) (0, import_node_child_process.execSync)(`git add ${JSON.stringify(s)}`, { stdio: "pipe" });
@@ -449,13 +454,18 @@ ${summary}`;
       if (status === "HAS_CHANGES") {
         (0, import_node_child_process.execSync)("git commit -F -", { stdio: "pipe", input: msg });
       }
-    } else {
-      for (const sub of submodules) commitIn(sub, null, msg);
-      commitIn(process.cwd(), null, msg);
+    } catch (e) {
+      errors.push(`parent: ${e.stderr?.toString?.() || e.message}`);
     }
-  } catch (e) {
-    console.error(`[FlowPilot] autoCommit \u5931\u8D25: ${e.stderr || e.message}`);
+  } else {
+    for (const sub of submodules) {
+      const err2 = commitIn(sub, null, msg);
+      if (err2) errors.push(err2);
+    }
+    const err = commitIn(process.cwd(), null, msg);
+    if (err) errors.push(err);
   }
+  return errors.length ? errors.join("\n") : null;
 }
 
 // src/infrastructure/verify.ts
@@ -648,9 +658,16 @@ ${def.description}
 ${detail}
 `);
       await this.updateSummary(data);
-      autoCommit(id, task.title, summaryLine, files);
+      const commitErr = autoCommit(id, task.title, summaryLine, files);
       const doneCount = data.tasks.filter((t) => t.status === "done").length;
-      const msg = `\u4EFB\u52A1 ${id} \u5B8C\u6210 (${doneCount}/${data.tasks.length}) [\u5DF2\u81EA\u52A8\u63D0\u4EA4]`;
+      let msg = `\u4EFB\u52A1 ${id} \u5B8C\u6210 (${doneCount}/${data.tasks.length})`;
+      if (commitErr) {
+        msg += `
+[git\u63D0\u4EA4\u5931\u8D25] ${commitErr}
+\u8BF7\u6839\u636E\u9519\u8BEF\u4FEE\u590D\u540E\u624B\u52A8\u6267\u884C git add -A && git commit`;
+      } else {
+        msg += " [\u5DF2\u81EA\u52A8\u63D0\u4EA4]";
+      }
       return isAllDone(data.tasks) ? msg + "\n\u5168\u90E8\u4EFB\u52A1\u5DF2\u5B8C\u6210\uFF0C\u8BF7\u6267\u884C node flow.js finish \u8FDB\u884C\u6536\u5C3E" : msg;
     } finally {
       await this.repo.unlock();
@@ -760,10 +777,16 @@ ${detail}
     const stats = [`${done.length} done`, skipped.length ? `${skipped.length} skipped` : "", failed.length ? `${failed.length} failed` : ""].filter(Boolean).join(", ");
     await this.repo.clearAll();
     const titles = done.map((t) => `- ${t.id}: ${t.title}`).join("\n");
-    autoCommit("finish", data.name || "\u5DE5\u4F5C\u6D41\u5B8C\u6210", `${stats}
+    const commitErr = autoCommit("finish", data.name || "\u5DE5\u4F5C\u6D41\u5B8C\u6210", `${stats}
 
 ${titles}`);
     const scripts = result.scripts.length ? result.scripts.join(", ") : "\u65E0\u9A8C\u8BC1\u811A\u672C";
+    if (commitErr) {
+      return `\u9A8C\u8BC1\u901A\u8FC7: ${scripts}
+${stats}
+[git\u63D0\u4EA4\u5931\u8D25] ${commitErr}
+\u8BF7\u6839\u636E\u9519\u8BEF\u4FEE\u590D\u540E\u624B\u52A8\u6267\u884C git add -A && git commit`;
+    }
     return `\u9A8C\u8BC1\u901A\u8FC7: ${scripts}
 ${stats}
 \u5DF2\u63D0\u4EA4\u6700\u7EC8commit\uFF0C\u5DE5\u4F5C\u6D41\u56DE\u5230\u5F85\u547D\u72B6\u6001

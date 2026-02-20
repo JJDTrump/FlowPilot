@@ -27,8 +27,8 @@ function groupBySubmodule(files: string[], submodules: string[]): Map<string, st
   return groups;
 }
 
-/** 在指定目录执行 git add + commit */
-function commitIn(cwd: string, files: string[] | null, msg: string): void {
+/** 在指定目录执行 git add + commit，返回错误信息或null */
+function commitIn(cwd: string, files: string[] | null, msg: string): string | null {
   const opts = { stdio: 'pipe' as const, cwd, encoding: 'utf-8' as const };
   try {
     if (files) {
@@ -40,8 +40,9 @@ function commitIn(cwd: string, files: string[] | null, msg: string): void {
     if (status === 'HAS_CHANGES') {
       execSync('git commit -F -', { ...opts, input: msg });
     }
+    return null;
   } catch (e: any) {
-    console.error(`[FlowPilot] git commit 失败 (${cwd}): ${e.stderr || e.message}`);
+    return `${cwd}: ${e.stderr?.toString?.() || e.message}`;
   }
 }
 
@@ -53,23 +54,27 @@ export function gitCleanup(): void {
   } catch {}
 }
 
-/** 自动 git add + commit，files 指定只提交特定文件 */
-export function autoCommit(taskId: string, title: string, summary: string, files?: string[]): void {
-  try {
-    const msg = `task-${taskId}: ${title}\n\n${summary}`;
-    const submodules = getSubmodules();
+/** 自动 git add + commit，返回错误信息或null */
+export function autoCommit(taskId: string, title: string, summary: string, files?: string[]): string | null {
+  const msg = `task-${taskId}: ${title}\n\n${summary}`;
+  const errors: string[] = [];
+  const submodules = getSubmodules();
 
-    if (!submodules.length) {
-      commitIn(process.cwd(), files?.length ? files : null, msg);
-      return;
-    }
+  if (!submodules.length) {
+    const err = commitIn(process.cwd(), files?.length ? files : null, msg);
+    return err;
+  }
 
-    if (files?.length) {
-      const groups = groupBySubmodule(files, submodules);
-      for (const [sub, subFiles] of groups) {
-        if (sub) commitIn(sub, subFiles, msg);
+  if (files?.length) {
+    const groups = groupBySubmodule(files, submodules);
+    for (const [sub, subFiles] of groups) {
+      if (sub) {
+        const err = commitIn(sub, subFiles, msg);
+        if (err) errors.push(err);
       }
-      // 父仓库：提交父仓库自身文件 + 更新子模块指针
+    }
+    // 父仓库：提交父仓库自身文件 + 更新子模块指针
+    try {
       const parentFiles = groups.get('') ?? [];
       const touchedSubs = [...groups.keys()].filter(k => k !== '');
       for (const s of touchedSubs) execSync(`git add ${JSON.stringify(s)}`, { stdio: 'pipe' });
@@ -78,12 +83,17 @@ export function autoCommit(taskId: string, title: string, summary: string, files
       if (status === 'HAS_CHANGES') {
         execSync('git commit -F -', { stdio: 'pipe', input: msg });
       }
-    } else {
-      // 无指定文件：所有子模块 + 父仓库全部提交
-      for (const sub of submodules) commitIn(sub, null, msg);
-      commitIn(process.cwd(), null, msg);
+    } catch (e: any) {
+      errors.push(`parent: ${e.stderr?.toString?.() || e.message}`);
     }
-  } catch (e: any) {
-    console.error(`[FlowPilot] autoCommit 失败: ${e.stderr || e.message}`);
+  } else {
+    for (const sub of submodules) {
+      const err = commitIn(sub, null, msg);
+      if (err) errors.push(err);
+    }
+    const err = commitIn(process.cwd(), null, msg);
+    if (err) errors.push(err);
   }
+
+  return errors.length ? errors.join('\n') : null;
 }
