@@ -217,9 +217,11 @@ src/
 │   ├── task-store.ts                # 任务状态管理（纯函数）
 │   └── workflow.ts                  # WorkflowDefinition 定义
 ├── application/
-│   └── workflow-service.ts          # 核心用例（8个命令）
+│   └── workflow-service.ts          # 核心用例（11个）
+├── domain/
+│   ├── ...
+│   └── repository.ts                # 仓储接口
 ├── infrastructure/
-│   ├── repository.ts                # 仓储接口
 │   ├── fs-repository.ts             # 文件系统实现 + CLAUDE.md协议嵌入 + Hooks注入
 │   ├── markdown-parser.ts           # 任务Markdown解析
 │   ├── git.ts                       # 自动git提交
