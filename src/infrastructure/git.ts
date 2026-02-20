@@ -38,7 +38,7 @@ function commitIn(cwd: string, files: string[] | null, msg: string): void {
     }
     const status = execSync('git diff --cached --quiet || echo HAS_CHANGES', opts).trim();
     if (status === 'HAS_CHANGES') {
-      execSync(`git commit -m ${JSON.stringify(msg)}`, opts);
+      execSync('git commit -F -', { ...opts, input: msg });
     }
   } catch (e: any) {
     console.error(`[FlowPilot] git commit 失败 (${cwd}): ${e.stderr || e.message}`);
@@ -68,7 +68,7 @@ export function autoCommit(taskId: string, title: string, summary: string, files
       for (const f of parentFiles) execSync(`git add ${JSON.stringify(f)}`, { stdio: 'pipe' });
       const status = execSync('git diff --cached --quiet || echo HAS_CHANGES', { stdio: 'pipe', encoding: 'utf-8' }).trim();
       if (status === 'HAS_CHANGES') {
-        execSync(`git commit -m ${JSON.stringify(msg)}`, { stdio: 'pipe' });
+        execSync('git commit -F -', { stdio: 'pipe', input: msg });
       }
     } else {
       // 无指定文件：所有子模块 + 父仓库全部提交
