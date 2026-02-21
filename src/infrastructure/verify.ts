@@ -4,7 +4,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 export interface VerifyResult {
@@ -14,13 +14,13 @@ export interface VerifyResult {
 }
 
 /** 自动检测并执行项目验证脚本 */
-export function runVerify(cwd: string): VerifyResult {
-  const cmds = detectCommands(cwd);
+export function runVerify(cwd: string, customCommands?: string[], timeout = 300_000): VerifyResult {
+  const cmds = customCommands?.length ? customCommands : detectCommands(cwd);
   if (!cmds.length) return { passed: true, scripts: [] };
 
   for (const cmd of cmds) {
     try {
-      execSync(cmd, { cwd, stdio: 'pipe', timeout: 300_000 });
+      execSync(cmd, { cwd, stdio: 'pipe', timeout });
     } catch (e: any) {
       const stderr = e.stderr?.length ? e.stderr.toString() : '';
       const stdout = e.stdout?.length ? e.stdout.toString() : '';
@@ -78,6 +78,46 @@ function detectCommands(cwd: string): string[] {
       if (targets.length) return targets;
     } catch { /* ignore */ }
   }
+
+  // .NET (C#/F#)
+  const dirEntries = (() => { try { return readdirSync(cwd); } catch { return []; } })();
+  if (dirEntries.some(f => f.endsWith('.sln') || f.endsWith('.csproj'))) {
+    return ['dotnet build', 'dotnet test'];
+  }
+
+  // Ruby
+  if (has('Gemfile')) {
+    const cmds: string[] = [];
+    if (has('.rubocop.yml')) cmds.push('rubocop');
+    cmds.push('bundle exec rake test');
+    return cmds;
+  }
+
+  // PHP (Composer)
+  if (has('composer.json')) {
+    const cmds: string[] = [];
+    try {
+      const pkg = JSON.parse(readFileSync(join(cwd, 'composer.json'), 'utf-8'));
+      const scripts = pkg.scripts || {};
+      if ('test' in scripts) cmds.push('composer test');
+      if ('lint' in scripts) cmds.push('composer lint');
+    } catch {}
+    if (!cmds.length) cmds.push('vendor/bin/phpunit');
+    return cmds;
+  }
+
+  // Elixir
+  if (has('mix.exs')) return ['mix compile', 'mix test'];
+
+  // Dart/Flutter
+  if (has('pubspec.yaml')) {
+    if (has('lib') && existsSync(join(cwd, 'test'))) {
+      return has('android') || has('ios') ? ['flutter analyze', 'flutter test'] : ['dart analyze', 'dart test'];
+    }
+  }
+
+  // Swift (SPM)
+  if (has('Package.swift')) return ['swift build', 'swift test'];
 
   return [];
 }

@@ -19,10 +19,10 @@ afterEach(async () => {
 
 function makeData(): ProgressData {
   return {
-    name: '测试项目', status: 'running', current: '001',
+    name: '测试项目', status: 'running', activeTaskIds: ['001'], startedAt: Date.now(),
     tasks: [
-      { id: '001', title: '设计数据库', description: '用PostgreSQL', type: 'backend', status: 'active', deps: [], summary: '', retries: 0 },
-      { id: '002', title: '创建页面', description: '', type: 'frontend', status: 'pending', deps: ['001'], summary: '', retries: 0 },
+      { id: '001', title: '设计数据库', description: '用PostgreSQL', type: 'backend', status: 'active', deps: [], summary: '', retries: 0, failHistory: [], timestamps: { created: Date.now() } },
+      { id: '002', title: '创建页面', description: '', type: 'frontend', status: 'pending', deps: ['001'], summary: '', retries: 0, failHistory: [], timestamps: { created: Date.now() } },
     ],
   };
 }

@@ -3,13 +3,29 @@
  * @description 仓储接口 - 持久化契约
  */
 
-import type { ProgressData } from './types';
+import type { FlowConfig, HistoryEntry, ProgressData } from './types';
 
 /** 验证结果 */
 export interface VerifyResult {
   passed: boolean;
   scripts: string[];
   error?: string;
+}
+
+/** Git 操作接口 */
+export interface GitService {
+  /** Git自动提交，返回错误信息或null */
+  commit(taskId: string, title: string, summary: string, files?: string[]): string | null;
+  /** Git清理未提交变更（resume时调用），用stash保留而非丢弃 */
+  cleanup(): void;
+  /** 清理过期的 stash 条目（保留最近 maxKeep 个） */
+  pruneStash(maxKeep?: number): void;
+}
+
+/** 项目验证接口 */
+export interface VerifyService {
+  /** 执行项目验证（build/test/lint） */
+  verify(config?: FlowConfig): VerifyResult;
 }
 
 /** 仓储接口 */
@@ -41,10 +57,27 @@ export interface WorkflowRepository {
   /** 文件锁 */
   lock(maxWait?: number): Promise<void>;
   unlock(): Promise<void>;
-  /** Git自动提交，返回错误信息或null */
-  commit(taskId: string, title: string, summary: string, files?: string[]): string | null;
-  /** Git清理未提交变更（resume时调用），用stash保留而非丢弃 */
-  cleanup(): void;
-  /** 执行项目验证（build/test/lint） */
-  verify(): VerifyResult;
+
+  /** 保存用户配置 */
+  saveConfig(config: FlowConfig): Promise<void>;
+  /** 加载用户配置 */
+  loadConfig(): Promise<FlowConfig>;
+
+  /** 追加执行历史 */
+  appendHistory(entry: HistoryEntry): Promise<void>;
+  /** 加载执行历史 */
+  loadHistory(): Promise<HistoryEntry[]>;
+
+  /** 移除 CLAUDE.md 中的工作流协议 */
+  removeClaudeMd(): Promise<void>;
+  /** 移除 hooks */
+  removeHooks(): Promise<void>;
+
+  /** 保存心跳（Compact 恢复用） */
+  saveHeartbeat(data: { lastCommand: string; timestamp: string; activeTaskIds: string[] }): Promise<void>;
+  /** 加载心跳（Compact 恢复用） */
+  loadHeartbeat(): Promise<{ lastCommand: string; timestamp: string; activeTaskIds: string[] } | null>;
+
+  /** 更新 CLAUDE.md 中的状态水印 */
+  updateWatermark(info: string): Promise<void>;
 }

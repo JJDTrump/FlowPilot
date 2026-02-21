@@ -93,40 +93,64 @@ export function completeTask(
   if (!t) throw new Error(`任务 ${id} 不存在`);
   t.status = 'done';
   t.summary = summary;
-  data.current = null;
+  t.timestamps.completed = Date.now();
+  data.activeTaskIds = data.activeTaskIds.filter(x => x !== id);
 }
 
 /** 标记任务失败（含重试计数） */
-export function failTask(data: ProgressData, id: string): 'retry' | 'skip' {
+export function failTask(data: ProgressData, id: string, reason?: string): 'retry' | 'skip' {
   const t = data.tasks.find(x => x.id === id);
   if (!t) throw new Error(`任务 ${id} 不存在`);
   t.retries++;
+  t.timestamps.lastFailed = Date.now();
+  if (reason) {
+    t.failHistory.push(`[第${t.retries}次] ${reason}`);
+  }
+  data.activeTaskIds = data.activeTaskIds.filter(x => x !== id);
   if (t.retries >= 3) {
     t.status = 'failed';
-    data.current = null;
     return 'skip';
   }
   t.status = 'pending';
-  data.current = null;
   return 'retry';
 }
 
 /** 恢复中断：将所有 active 任务重置为 pending（支持并行中断恢复） */
-export function resumeProgress(data: ProgressData): string | null {
-  let firstId: string | null = null;
+export function resumeProgress(data: ProgressData): string[] {
+  const resetIds: string[] = [];
   for (const t of data.tasks) {
     if (t.status === 'active') {
       t.status = 'pending';
-      if (!firstId) firstId = t.id;
+      t.timestamps.started = undefined;
+      resetIds.push(t.id);
     }
   }
-  if (firstId) {
-    data.current = null;
+  if (resetIds.length) {
+    data.activeTaskIds = [];
     data.status = 'running';
-    return firstId;
+    return resetIds;
   }
-  if (data.status === 'running') return data.current;
-  return null;
+  if (data.status === 'running') return [];
+  return [];
+}
+
+/**
+ * 检测并标记超时的 active 任务
+ * @param tasks 任务列表
+ * @param timeoutMs 超时时间（毫秒），默认 30 分钟
+ * @returns 被标记为超时的任务 ID 列表
+ */
+export function detectTimeoutTasks(tasks: TaskEntry[], timeoutMs = 30 * 60 * 1000): string[] {
+  const now = Date.now();
+  const timedOut: string[] = [];
+  for (const t of tasks) {
+    if (t.status === 'active' && t.timestamps.started) {
+      if (now - t.timestamps.started > timeoutMs) {
+        timedOut.push(t.id);
+      }
+    }
+  }
+  return timedOut;
 }
 
 /** 查找所有可并行执行的任务（依赖已满足的pending任务） */

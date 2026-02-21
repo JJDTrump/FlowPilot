@@ -4,11 +4,11 @@ import type { TaskEntry, ProgressData } from './types';
 
 /** 快速创建任务 */
 function t(id: string, status: TaskEntry['status'] = 'pending', deps: string[] = []): TaskEntry {
-  return { id, title: `task-${id}`, description: '', type: 'general', status, deps, summary: '', retries: 0 };
+  return { id, title: `task-${id}`, description: '', type: 'general', status, deps, summary: '', retries: 0, failHistory: [], timestamps: { created: Date.now() } };
 }
 
 function prog(tasks: TaskEntry[], status: ProgressData['status'] = 'running'): ProgressData {
-  return { name: 'test', status, current: null, tasks };
+  return { name: 'test', status, activeTaskIds: [], tasks, startedAt: Date.now() };
 }
 
 describe('makeTaskId', () => {
@@ -62,11 +62,11 @@ describe('findParallelTasks', () => {
 describe('completeTask', () => {
   it('标记done并记录摘要', () => {
     const data = prog([t('001', 'active')]);
-    data.current = '001';
+    data.activeTaskIds = ['001'];
     completeTask(data, '001', '完成了');
     expect(data.tasks[0].status).toBe('done');
     expect(data.tasks[0].summary).toBe('完成了');
-    expect(data.current).toBeNull();
+    expect(data.activeTaskIds).not.toContain('001');
   });
 
   it('不存在的任务抛错', () => {
@@ -97,7 +97,7 @@ describe('resumeProgress', () => {
   it('重置active为pending', () => {
     const data = prog([t('001', 'active'), t('002', 'active'), t('003', 'done')]);
     const id = resumeProgress(data);
-    expect(id).toBe('001');
+    expect(id).toEqual(['001', '002']);
     expect(data.tasks[0].status).toBe('pending');
     expect(data.tasks[1].status).toBe('pending');
     expect(data.tasks[2].status).toBe('done');
@@ -105,7 +105,7 @@ describe('resumeProgress', () => {
 
   it('无active任务返回null', () => {
     const data = prog([t('001', 'done')]);
-    expect(resumeProgress(data)).toBeNull();
+    expect(resumeProgress(data)).toEqual([]);
   });
 });
 

@@ -5,6 +5,7 @@ import { tmpdir } from 'os';
 import { WorkflowService } from './workflow-service';
 import { FsWorkflowRepository } from '../infrastructure/fs-repository';
 import { parseTasksMarkdown } from '../infrastructure/markdown-parser';
+import type { GitService, VerifyService } from '../domain/repository';
 
 let dir: string;
 let svc: WorkflowService;
@@ -21,10 +22,20 @@ const TASKS_MD = `# 集成测试
   API文档
 `;
 
+const mockGit: GitService = {
+  commit: () => null,
+  cleanup: () => {},
+  pruneStash: () => {},
+};
+
+const mockVerifier: VerifyService = {
+  verify: () => ({ passed: true, scripts: [] }),
+};
+
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'flow-int-'));
   const repo = new FsWorkflowRepository(dir);
-  svc = new WorkflowService(repo, parseTasksMarkdown);
+  svc = new WorkflowService(repo, mockGit, mockVerifier, parseTasksMarkdown);
 });
 
 afterEach(async () => {

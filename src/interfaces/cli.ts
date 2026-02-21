@@ -8,6 +8,7 @@ import { resolve, relative } from 'path';
 import type { WorkflowService } from '../application/workflow-service';
 import { formatStatus, formatTask, formatBatch } from './formatter';
 import { readStdinIfPiped } from './stdin';
+import { VALID_TASK_TYPES } from '../domain/types';
 
 
 export class CLI {
@@ -19,7 +20,11 @@ export class CLI {
       const output = await this.dispatch(args);
       process.stdout.write(output + '\n');
     } catch (e) {
-      process.stderr.write(`错误: ${e instanceof Error ? e.message : e}\n`);
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`错误: ${msg}\n`);
+      if (args.includes('--verbose') && e instanceof Error && e.stack) {
+        process.stderr.write(e.stack + '\n');
+      }
       process.exitCode = 1;
     }
   }
@@ -103,14 +108,71 @@ export class CLI {
         return await s.resume();
 
       case 'add': {
+        const depsIdx = rest.indexOf('--deps');
+        let deps: string[] = [];
+        if (depsIdx !== -1 && rest[depsIdx + 1]) {
+          deps = rest[depsIdx + 1].split(',').map(d => d.trim()).filter(Boolean);
+          rest.splice(depsIdx, 2);
+        }
+
+        const descIdx = rest.indexOf('--desc');
+        let desc = '';
+        if (descIdx !== -1 && rest[descIdx + 1]) {
+          desc = rest[descIdx + 1];
+          rest.splice(descIdx, 2);
+        }
+
         const typeIdx = rest.indexOf('--type');
-        const rawType = (typeIdx >= 0 && rest[typeIdx + 1]) || 'general';
-        const validTypes = new Set(['frontend', 'backend', 'general']);
-        const type = validTypes.has(rawType) ? rawType : 'general';
-        const title = rest.filter((_, i) => i !== typeIdx && i !== typeIdx + 1).join(' ');
-        if (!title) throw new Error('需要任务描述');
-        return await s.add(title, type as any);
+        let type = 'general';
+        if (typeIdx !== -1 && rest[typeIdx + 1]) {
+          type = rest[typeIdx + 1];
+          if (!VALID_TASK_TYPES.has(type)) throw new Error(`无效的类型: ${type}`);
+          rest.splice(typeIdx, 2);
+        }
+
+        const title = rest.join(' ');
+        if (!title) throw new Error('需要任务标题');
+        return s.add(title, type as any, desc, deps);
       }
+
+      case 'edit': {
+        const id = rest[0];
+        if (!id) throw new Error('需要任务ID');
+        const updates: Record<string, any> = {};
+
+        const titleIdx = rest.indexOf('--title');
+        if (titleIdx !== -1 && rest[titleIdx + 1]) updates.title = rest[titleIdx + 1];
+
+        const descIdx = rest.indexOf('--desc');
+        if (descIdx !== -1 && rest[descIdx + 1]) updates.description = rest[descIdx + 1];
+
+        const typeIdx = rest.indexOf('--type');
+        if (typeIdx !== -1 && rest[typeIdx + 1]) {
+          const t = rest[typeIdx + 1];
+          if (!VALID_TASK_TYPES.has(t)) throw new Error(`无效的类型: ${t}，可选: ${[...VALID_TASK_TYPES].join(', ')}`);
+          updates.type = t;
+        }
+
+        const depsIdx = rest.indexOf('--deps');
+        if (depsIdx !== -1 && rest[depsIdx + 1]) {
+          updates.deps = rest[depsIdx + 1].split(',').map(d => d.trim()).filter(Boolean);
+        }
+
+        if (!Object.keys(updates).length) throw new Error('至少指定一个修改项: --title, --desc, --type, --deps');
+        return s.edit(id, updates);
+      }
+
+      case 'show': {
+        const id = rest[0];
+        if (!id) throw new Error('需要任务ID');
+        return s.show(id);
+      }
+
+      case 'log':
+        return s.log();
+
+      case 'pause':
+        return s.pause();
 
       default:
         return USAGE;
@@ -123,8 +185,12 @@ const USAGE = `用法: node flow.js <command>
   next [--batch]       获取下一个待执行任务 (--batch 返回所有可并行任务)
   checkpoint <id>      记录任务完成 [--file <path> | stdin | 内联文本] [--files f1 f2 ...]
   skip <id>            手动跳过任务
+  edit <id>            修改任务 [--title X] [--desc X] [--type X] [--deps 001,002]
+  show <id>            查看任务详情
+  log                  查看执行历史
+  pause                暂停工作流（resume 恢复）
   review               标记code-review已完成 (finish前必须执行)
   finish               智能收尾 (验证+总结+回到待命，需先review)
   status               查看全局进度
   resume               中断恢复
-  add <描述>           追加任务 [--type frontend|backend|general]`;
+  add <描述>           追加任务 [--type frontend|backend|general] [--desc X] [--deps 001,002]`;

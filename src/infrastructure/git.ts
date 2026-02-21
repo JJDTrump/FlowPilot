@@ -46,15 +46,51 @@ function commitIn(cwd: string, files: string[] | null, msg: string): string | nu
   }
 }
 
-/** 清理未提交的变更（resume时调用），用stash保留而非丢弃 */
-export function gitCleanup(): void {
+/**
+ * 清理未提交的变更（resume时调用），用stash保留而非丢弃。
+ * 保留最近 maxKeep 个 flowpilot stash 条目，自动 drop 更老的。
+ */
+export function gitDiscardInterruptedChanges(): void {
   try {
     const status = execSync('git status --porcelain', { stdio: 'pipe', encoding: 'utf-8' }).trim();
     if (status) {
       execSync('git stash push -m "flowpilot-resume: auto-stashed on interrupt recovery"', { stdio: 'pipe' });
     }
+  } catch (e: any) {
+    // 不再静默吞错，输出到 stderr
+    process.stderr.write(`[flowpilot] git stash 警告: ${e.message}\n`);
+  }
+}
+
+/**
+ * 清理过期的 flowpilot stash 条目
+ */
+export function pruneFlowpilotStash(maxKeep = 5): void {
+  try {
+    const list = execSync('git stash list', { stdio: 'pipe', encoding: 'utf-8' }).trim();
+    if (!list) return;
+
+    const entries = list.split('\n');
+    const fpEntries: number[] = [];
+
+    entries.forEach((line, i) => {
+      if (line.includes('flowpilot-resume:')) {
+        fpEntries.push(i);
+      }
+    });
+
+    // 保留最近 maxKeep 个，drop 更老的（从后往前 drop 避免索引偏移）
+    const toDrop = fpEntries.slice(maxKeep);
+    for (let i = toDrop.length - 1; i >= 0; i--) {
+      try {
+        execSync(`git stash drop stash@{${toDrop[i]}}`, { stdio: 'pipe' });
+      } catch {}
+    }
   } catch {}
 }
+
+/** @deprecated 使用 gitDiscardInterruptedChanges */
+export const gitCleanup = gitDiscardInterruptedChanges;
 
 /** 自动 git add + commit，返回错误信息或null */
 export function autoCommit(taskId: string, title: string, summary: string, files?: string[]): string | null {

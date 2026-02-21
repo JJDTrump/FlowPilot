@@ -10,7 +10,7 @@ import { WorkflowService } from './application/workflow-service';
 import { CLI } from './interfaces/cli';
 
 const repo = new FsWorkflowRepository(process.cwd());
-const service = new WorkflowService(repo, parseTasksMarkdown);
+const service = new WorkflowService(repo, repo, repo, parseTasksMarkdown);
 const cli = new CLI(service);
 
 cli.run(process.argv);

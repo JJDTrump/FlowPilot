@@ -5,10 +5,11 @@
 
 import { mkdir, readFile, writeFile, unlink, rm, rename } from 'fs/promises';
 import { join } from 'path';
-import { openSync, closeSync, existsSync } from 'fs';
-import type { ProgressData, TaskEntry } from '../domain/types';
-import type { WorkflowRepository, VerifyResult } from '../domain/repository';
-import { autoCommit, gitCleanup } from './git';
+import { openSync, closeSync, writeSync, readFileSync, unlinkSync } from 'fs';
+import type { ProgressData, TaskEntry, FlowConfig, HistoryEntry } from '../domain/types';
+import { DEFAULT_CONFIG } from '../domain/types';
+import type { WorkflowRepository, VerifyResult, GitService, VerifyService } from '../domain/repository';
+import { autoCommit, gitDiscardInterruptedChanges, pruneFlowpilotStash } from './git';
 import { runVerify } from './verify';
 
 /** Generate the CLAUDE.md rule block */
@@ -91,7 +92,7 @@ echo '一句话摘要' | node flow.js checkpoint <id> --files file1 file2 ...
 <!-- flowpilot:end -->`;
 }
 
-export class FsWorkflowRepository implements WorkflowRepository {
+export class FsWorkflowRepository implements WorkflowRepository, GitService, VerifyService {
   private readonly root: string;
   private readonly ctxDir: string;
 
@@ -109,29 +110,51 @@ export class FsWorkflowRepository implements WorkflowRepository {
     await mkdir(dir, { recursive: true });
   }
 
-  /** 文件锁：用 O_EXCL 创建 lockfile，防止并发读写 */
-  async lock(maxWait = 5000): Promise<void> {
+  /** 文件锁：用 O_EXCL 创建 lockfile + PID 活性检测，防止并发读写 */
+  async lock(maxWait = 30000): Promise<void> {
     await this.ensure(this.root);
     const lockPath = join(this.root, '.lock');
     const start = Date.now();
+
     while (Date.now() - start < maxWait) {
       try {
         const fd = openSync(lockPath, 'wx');
+        // 写入 PID + 时间戳用于活性检测
+        const info = `${process.pid}\n${Date.now()}\n`;
+        writeSync(fd, info);
         closeSync(fd);
         return;
       } catch {
+        // 检查锁持有者是否仍然存活
+        try {
+          const content = readFileSync(lockPath, 'utf-8');
+          const [pidStr, tsStr] = content.split('\n');
+          const holderPid = parseInt(pidStr, 10);
+          const lockAge = Date.now() - parseInt(tsStr, 10);
+
+          if (holderPid && !isNaN(holderPid)) {
+            try {
+              process.kill(holderPid, 0); // 测试进程是否存活
+            } catch {
+              // 持有者进程已死，安全地破锁
+              try { unlinkSync(lockPath); } catch {}
+              continue;
+            }
+          }
+
+          // 持有者存活但锁超过 60 秒，可能是僵尸
+          if (lockAge > 60000) {
+            try { unlinkSync(lockPath); } catch {}
+            continue;
+          }
+        } catch {
+          // 锁文件不可读（可能正在被创建），等待下一轮
+        }
         await new Promise(r => setTimeout(r, 50));
       }
     }
-    // 超时强制清除死锁，再尝试一次
-    try { await unlink(lockPath); } catch {}
-    try {
-      const fd = openSync(lockPath, 'wx');
-      closeSync(fd);
-      return;
-    } catch {
-      throw new Error('无法获取文件锁');
-    }
+    // 超时后绝不静默破锁，直接抛错
+    throw new Error('无法获取文件锁（超时），可能有另一个 flow.js 进程正在运行');
   }
 
   async unlock(): Promise<void> {
@@ -146,7 +169,6 @@ export class FsWorkflowRepository implements WorkflowRepository {
       `# ${data.name}`,
       '',
       `状态: ${data.status}`,
-      `当前: ${data.current ?? '无'}`,
       '',
       '| ID | 标题 | 类型 | 依赖 | 状态 | 重试 | 摘要 | 描述 |',
       '|----|------|------|------|------|------|------|------|',
@@ -156,17 +178,27 @@ export class FsWorkflowRepository implements WorkflowRepository {
       const esc = (s: string) => (s || '-').replace(/\|/g, '∣').replace(/\n/g, ' ');
       lines.push(`| ${t.id} | ${esc(t.title)} | ${t.type} | ${deps} | ${t.status} | ${t.retries} | ${esc(t.summary)} | ${esc(t.description)} |`);
     }
+    // 底部元数据行
+    const meta = {
+      startedAt: data.startedAt,
+      activeTaskIds: data.activeTaskIds,
+    };
+    lines.push('');
+    lines.push(`<!-- meta: ${JSON.stringify(meta)} -->`);
+
     const p = join(this.root, 'progress.md');
-    await writeFile(p + '.tmp', lines.join('\n') + '\n', 'utf-8');
-    await rename(p + '.tmp', p);
+    const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tmp, lines.join('\n') + '\n', 'utf-8');
+    await rename(tmp, p);
   }
 
   async loadProgress(): Promise<ProgressData | null> {
     try {
       const raw = await readFile(join(this.root, 'progress.md'), 'utf-8');
       return this.parseProgress(raw);
-    } catch {
-      return null;
+    } catch (e: any) {
+      if (e.code === 'ENOENT') return null;
+      throw new Error(`读取 progress.md 失败: ${e.message}`);
     }
   }
 
@@ -176,7 +208,8 @@ export class FsWorkflowRepository implements WorkflowRepository {
     const lines = raw.split('\n');
     const name = (lines[0] ?? '').replace(/^#\s*/, '').trim();
     let status = 'idle' as ProgressData['status'];
-    let current: string | null = null;
+    let activeTaskIds: string[] = [];
+    let startedAt = 0;
     const tasks: TaskEntry[] = [];
 
     for (const line of lines) {
@@ -184,8 +217,16 @@ export class FsWorkflowRepository implements WorkflowRepository {
         const s = line.slice(4).trim();
         status = (validWfStatus.has(s) ? s : 'idle') as ProgressData['status'];
       }
-      if (line.startsWith('当前: ')) current = line.slice(4).trim();
-      if (current === '无') current = null;
+
+      // 解析元数据注释行
+      const metaMatch = line.match(/^<!-- meta: ({.*}) -->$/);
+      if (metaMatch) {
+        try {
+          const meta = JSON.parse(metaMatch[1]);
+          if (Array.isArray(meta.activeTaskIds)) activeTaskIds = meta.activeTaskIds;
+          if (typeof meta.startedAt === 'number') startedAt = meta.startedAt;
+        } catch {}
+      }
 
       const m = line.match(/^\|\s*(\d{3,})\s*\|\s*(.+?)\s*\|\s*(\w+)\s*\|\s*([^|]*?)\s*\|\s*(\w+)\s*\|\s*(\d+)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|$/);
       if (m) {
@@ -197,12 +238,13 @@ export class FsWorkflowRepository implements WorkflowRepository {
           retries: parseInt(m[6], 10),
           summary: m[7] === '-' ? '' : m[7],
           description: m[8] === '-' ? '' : m[8],
+          failHistory: [],
+          timestamps: { created: startedAt || Date.now() },
         });
       }
     }
 
-    // 从 tasks.md 补充 deps 信息
-    return { name, status, current, tasks };
+    return { name, status, activeTaskIds, tasks, startedAt };
   }
 
   // --- context/ 任务详细产出 ---
@@ -218,15 +260,17 @@ export class FsWorkflowRepository implements WorkflowRepository {
   async saveTaskContext(taskId: string, content: string): Promise<void> {
     await this.ensure(this.ctxDir);
     const p = join(this.ctxDir, `task-${taskId}.md`);
-    await writeFile(p + '.tmp', content, 'utf-8');
-    await rename(p + '.tmp', p);
+    const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tmp, content, 'utf-8');
+    await rename(tmp, p);
   }
 
   async loadTaskContext(taskId: string): Promise<string | null> {
     try {
       return await readFile(join(this.ctxDir, `task-${taskId}.md`), 'utf-8');
-    } catch {
-      return null;
+    } catch (e: any) {
+      if (e.code === 'ENOENT') return null;
+      throw new Error(`读取 task-${taskId}.md 失败: ${e.message}`);
     }
   }
 
@@ -235,15 +279,17 @@ export class FsWorkflowRepository implements WorkflowRepository {
   async saveSummary(content: string): Promise<void> {
     await this.ensure(this.ctxDir);
     const p = join(this.ctxDir, 'summary.md');
-    await writeFile(p + '.tmp', content, 'utf-8');
-    await rename(p + '.tmp', p);
+    const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tmp, content, 'utf-8');
+    await rename(tmp, p);
   }
 
   async loadSummary(): Promise<string> {
     try {
       return await readFile(join(this.ctxDir, 'summary.md'), 'utf-8');
-    } catch {
-      return '';
+    } catch (e: any) {
+      if (e.code === 'ENOENT') return '';
+      throw new Error(`读取 summary.md 失败: ${e.message}`);
     }
   }
 
@@ -257,8 +303,9 @@ export class FsWorkflowRepository implements WorkflowRepository {
   async loadTasks(): Promise<string | null> {
     try {
       return await readFile(join(this.root, 'tasks.md'), 'utf-8');
-    } catch {
-      return null;
+    } catch (e: any) {
+      if (e.code === 'ENOENT') return null;
+      throw new Error(`读取 tasks.md 失败: ${e.message}`);
     }
   }
 
@@ -303,15 +350,134 @@ export class FsWorkflowRepository implements WorkflowRepository {
     return true;
   }
 
+  // --- Git / Verify ---
+
   commit(taskId: string, title: string, summary: string, files?: string[]): string | null {
     return autoCommit(taskId, title, summary, files);
   }
 
   cleanup(): void {
-    gitCleanup();
+    gitDiscardInterruptedChanges();
   }
 
-  verify(): VerifyResult {
-    return runVerify(this.base);
+  pruneStash(maxKeep = 5): void {
+    pruneFlowpilotStash(maxKeep);
+  }
+
+  verify(config?: FlowConfig): VerifyResult {
+    return runVerify(this.base, config?.verifyCommands, config?.verifyTimeout);
+  }
+
+  // --- 配置 ---
+
+  async saveConfig(config: FlowConfig): Promise<void> {
+    const p = join(this.root, 'config.json');
+    await writeFile(p, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+  }
+
+  async loadConfig(): Promise<FlowConfig> {
+    try {
+      const raw = await readFile(join(this.root, 'config.json'), 'utf-8');
+      return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
+    } catch {
+      return { ...DEFAULT_CONFIG };
+    }
+  }
+
+  // --- 执行历史 ---
+
+  async appendHistory(entry: HistoryEntry): Promise<void> {
+    const p = join(this.root, 'history.jsonl');
+    const line = JSON.stringify(entry) + '\n';
+    await writeFile(p, line, { flag: 'a' } as any);
+  }
+
+  async loadHistory(): Promise<HistoryEntry[]> {
+    try {
+      const raw = await readFile(join(this.root, 'history.jsonl'), 'utf-8');
+      return raw.trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+    } catch (e: any) {
+      if (e.code === 'ENOENT') return [];
+      throw e;
+    }
+  }
+
+  // --- CLAUDE.md 清理 ---
+
+  async removeClaudeMd(): Promise<void> {
+    const p = join(this.base, 'CLAUDE.md');
+    try {
+      const content = await readFile(p, 'utf-8');
+      const cleaned = content.replace(
+        /\n*<!-- flowpilot:start -->[\s\S]*?<!-- flowpilot:end -->\n*/g,
+        '\n'
+      );
+      // 同时清理水印
+      const final = cleaned.replace(
+        /\n*<!-- flowpilot:watermark -->[\s\S]*?<!-- flowpilot:watermark:end -->\n*/g,
+        '\n'
+      );
+      await writeFile(p, final.trimEnd() + '\n', 'utf-8');
+    } catch {}
+  }
+
+  // --- Hooks 清理 ---
+
+  async removeHooks(): Promise<void> {
+    const p = join(this.base, '.claude', 'settings.json');
+    try {
+      const raw = await readFile(p, 'utf-8');
+      const settings = JSON.parse(raw);
+      const pre = settings.hooks?.PreToolUse;
+      if (Array.isArray(pre)) {
+        settings.hooks.PreToolUse = pre.filter(
+          (h: any) => !h.hooks?.[0]?.prompt?.includes?.('FlowPilot')
+        );
+        if (!settings.hooks.PreToolUse.length) delete settings.hooks.PreToolUse;
+        if (!Object.keys(settings.hooks || {}).length) delete settings.hooks;
+      }
+      await writeFile(p, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+    } catch {}
+  }
+
+  // --- 心跳（Compact 恢复） ---
+
+  async saveHeartbeat(data: { lastCommand: string; timestamp: string; activeTaskIds: string[] }): Promise<void> {
+    const p = join(this.root, 'heartbeat.json');
+    await writeFile(p, JSON.stringify(data) + '\n', 'utf-8');
+  }
+
+  async loadHeartbeat(): Promise<{ lastCommand: string; timestamp: string; activeTaskIds: string[] } | null> {
+    try {
+      const raw = await readFile(join(this.root, 'heartbeat.json'), 'utf-8');
+      return JSON.parse(raw);
+    } catch (e: any) {
+      if (e.code === 'ENOENT') return null;
+      return null;
+    }
+  }
+
+  // --- CLAUDE.md 状态水印 ---
+
+  async updateWatermark(info: string): Promise<void> {
+    const p = join(this.base, 'CLAUDE.md');
+    try {
+      let content = await readFile(p, 'utf-8');
+      const watermark = `<!-- flowpilot:watermark -->\n${info}\n<!-- flowpilot:watermark:end -->`;
+      if (content.includes('<!-- flowpilot:watermark -->')) {
+        content = content.replace(
+          /<!-- flowpilot:watermark -->[\s\S]*?<!-- flowpilot:watermark:end -->/,
+          watermark
+        );
+      } else if (content.includes('<!-- flowpilot:end -->')) {
+        content = content.replace(
+          '<!-- flowpilot:end -->',
+          '<!-- flowpilot:end -->\n\n' + watermark
+        );
+      } else {
+        content += '\n\n' + watermark + '\n';
+      }
+      await writeFile(p, content, 'utf-8');
+    } catch {}
   }
 }

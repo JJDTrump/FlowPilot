@@ -9,14 +9,27 @@ const ICON: Record<string, string> = {
   pending: '[ ]', active: '[>]', done: '[x]', skipped: '[-]', failed: '[!]',
 };
 
+function progressBar(done: number, total: number, width = 20): string {
+  const pct = total ? Math.round(done / total * 100) : 0;
+  const filled = Math.round(done / total * width);
+  const bar = '\u2588'.repeat(filled) + '\u2591'.repeat(width - filled);
+  return `[${bar}] ${pct}%`;
+}
+
 /** 格式化进度状态 */
 export function formatStatus(data: ProgressData): string {
   const done = data.tasks.filter(t => t.status === 'done').length;
   const lines = [
     `=== ${data.name} ===`,
-    `状态: ${data.status} | 进度: ${done}/${data.tasks.length}`,
-    '',
+    `状态: ${data.status} | 进度: ${progressBar(done, data.tasks.length)} (${done}/${data.tasks.length})`,
   ];
+
+  if (data.activeTaskIds.length) {
+    lines.push(`活跃: ${data.activeTaskIds.join(', ')}`);
+  }
+
+  lines.push('');
+
   for (const t of data.tasks) {
     lines.push(`${ICON[t.status] ?? '[ ]'} ${t.id} [${t.type}] ${t.title}${t.summary ? ' - ' + t.summary : ''}`);
   }

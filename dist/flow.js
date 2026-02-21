@@ -6,6 +6,17 @@ var import_promises = require("fs/promises");
 var import_path = require("path");
 var import_fs = require("fs");
 
+// src/domain/types.ts
+var TASK_TYPES = ["frontend", "backend", "general"];
+var VALID_TASK_TYPES = new Set(TASK_TYPES);
+var DEFAULT_CONFIG = {
+  autoCommit: true,
+  verifyTimeout: 3e5,
+  summaryCompressThreshold: 50,
+  maxRetries: 3,
+  lockTimeout: 3e4
+};
+
 // src/infrastructure/git.ts
 var import_node_child_process = require("child_process");
 var import_node_fs = require("fs");
@@ -43,11 +54,34 @@ function commitIn(cwd, files, msg) {
     return `${cwd}: ${e.stderr?.toString?.() || e.message}`;
   }
 }
-function gitCleanup() {
+function gitDiscardInterruptedChanges() {
   try {
     const status = (0, import_node_child_process.execSync)("git status --porcelain", { stdio: "pipe", encoding: "utf-8" }).trim();
     if (status) {
       (0, import_node_child_process.execSync)('git stash push -m "flowpilot-resume: auto-stashed on interrupt recovery"', { stdio: "pipe" });
+    }
+  } catch (e) {
+    process.stderr.write(`[flowpilot] git stash \u8B66\u544A: ${e.message}
+`);
+  }
+}
+function pruneFlowpilotStash(maxKeep = 5) {
+  try {
+    const list = (0, import_node_child_process.execSync)("git stash list", { stdio: "pipe", encoding: "utf-8" }).trim();
+    if (!list) return;
+    const entries = list.split("\n");
+    const fpEntries = [];
+    entries.forEach((line, i) => {
+      if (line.includes("flowpilot-resume:")) {
+        fpEntries.push(i);
+      }
+    });
+    const toDrop = fpEntries.slice(maxKeep);
+    for (let i = toDrop.length - 1; i >= 0; i--) {
+      try {
+        (0, import_node_child_process.execSync)(`git stash drop stash@{${toDrop[i]}}`, { stdio: "pipe" });
+      } catch {
+      }
     }
   } catch {
   }
@@ -97,12 +131,12 @@ ${summary}`;
 var import_node_child_process2 = require("child_process");
 var import_node_fs2 = require("fs");
 var import_node_path = require("path");
-function runVerify(cwd) {
-  const cmds = detectCommands(cwd);
+function runVerify(cwd, customCommands, timeout = 3e5) {
+  const cmds = customCommands?.length ? customCommands : detectCommands(cwd);
   if (!cmds.length) return { passed: true, scripts: [] };
   for (const cmd of cmds) {
     try {
-      (0, import_node_child_process2.execSync)(cmd, { cwd, stdio: "pipe", timeout: 3e5 });
+      (0, import_node_child_process2.execSync)(cmd, { cwd, stdio: "pipe", timeout });
     } catch (e) {
       const stderr = e.stderr?.length ? e.stderr.toString() : "";
       const stdout = e.stdout?.length ? e.stdout.toString() : "";
@@ -153,6 +187,41 @@ function detectCommands(cwd) {
     } catch {
     }
   }
+  const dirEntries = (() => {
+    try {
+      return (0, import_node_fs2.readdirSync)(cwd);
+    } catch {
+      return [];
+    }
+  })();
+  if (dirEntries.some((f) => f.endsWith(".sln") || f.endsWith(".csproj"))) {
+    return ["dotnet build", "dotnet test"];
+  }
+  if (has("Gemfile")) {
+    const cmds = [];
+    if (has(".rubocop.yml")) cmds.push("rubocop");
+    cmds.push("bundle exec rake test");
+    return cmds;
+  }
+  if (has("composer.json")) {
+    const cmds = [];
+    try {
+      const pkg = JSON.parse((0, import_node_fs2.readFileSync)((0, import_node_path.join)(cwd, "composer.json"), "utf-8"));
+      const scripts = pkg.scripts || {};
+      if ("test" in scripts) cmds.push("composer test");
+      if ("lint" in scripts) cmds.push("composer lint");
+    } catch {
+    }
+    if (!cmds.length) cmds.push("vendor/bin/phpunit");
+    return cmds;
+  }
+  if (has("mix.exs")) return ["mix compile", "mix test"];
+  if (has("pubspec.yaml")) {
+    if (has("lib") && (0, import_node_fs2.existsSync)((0, import_node_path.join)(cwd, "test"))) {
+      return has("android") || has("ios") ? ["flutter analyze", "flutter test"] : ["dart analyze", "dart test"];
+    }
+  }
+  if (has("Package.swift")) return ["swift build", "swift test"];
   return [];
 }
 
@@ -250,31 +319,50 @@ var FsWorkflowRepository = class {
   async ensure(dir) {
     await (0, import_promises.mkdir)(dir, { recursive: true });
   }
-  /** 文件锁：用 O_EXCL 创建 lockfile，防止并发读写 */
-  async lock(maxWait = 5e3) {
+  /** 文件锁：用 O_EXCL 创建 lockfile + PID 活性检测，防止并发读写 */
+  async lock(maxWait = 3e4) {
     await this.ensure(this.root);
     const lockPath = (0, import_path.join)(this.root, ".lock");
     const start = Date.now();
     while (Date.now() - start < maxWait) {
       try {
         const fd = (0, import_fs.openSync)(lockPath, "wx");
+        const info = `${process.pid}
+${Date.now()}
+`;
+        (0, import_fs.writeSync)(fd, info);
         (0, import_fs.closeSync)(fd);
         return;
       } catch {
+        try {
+          const content = (0, import_fs.readFileSync)(lockPath, "utf-8");
+          const [pidStr, tsStr] = content.split("\n");
+          const holderPid = parseInt(pidStr, 10);
+          const lockAge = Date.now() - parseInt(tsStr, 10);
+          if (holderPid && !isNaN(holderPid)) {
+            try {
+              process.kill(holderPid, 0);
+            } catch {
+              try {
+                (0, import_fs.unlinkSync)(lockPath);
+              } catch {
+              }
+              continue;
+            }
+          }
+          if (lockAge > 6e4) {
+            try {
+              (0, import_fs.unlinkSync)(lockPath);
+            } catch {
+            }
+            continue;
+          }
+        } catch {
+        }
         await new Promise((r) => setTimeout(r, 50));
       }
     }
-    try {
-      await (0, import_promises.unlink)(lockPath);
-    } catch {
-    }
-    try {
-      const fd = (0, import_fs.openSync)(lockPath, "wx");
-      (0, import_fs.closeSync)(fd);
-      return;
-    } catch {
-      throw new Error("\u65E0\u6CD5\u83B7\u53D6\u6587\u4EF6\u9501");
-    }
+    throw new Error("\u65E0\u6CD5\u83B7\u53D6\u6587\u4EF6\u9501\uFF08\u8D85\u65F6\uFF09\uFF0C\u53EF\u80FD\u6709\u53E6\u4E00\u4E2A flow.js \u8FDB\u7A0B\u6B63\u5728\u8FD0\u884C");
   }
   async unlock() {
     try {
@@ -289,7 +377,6 @@ var FsWorkflowRepository = class {
       `# ${data.name}`,
       "",
       `\u72B6\u6001: ${data.status}`,
-      `\u5F53\u524D: ${data.current ?? "\u65E0"}`,
       "",
       "| ID | \u6807\u9898 | \u7C7B\u578B | \u4F9D\u8D56 | \u72B6\u6001 | \u91CD\u8BD5 | \u6458\u8981 | \u63CF\u8FF0 |",
       "|----|------|------|------|------|------|------|------|"
@@ -299,16 +386,24 @@ var FsWorkflowRepository = class {
       const esc = (s) => (s || "-").replace(/\|/g, "\u2223").replace(/\n/g, " ");
       lines.push(`| ${t.id} | ${esc(t.title)} | ${t.type} | ${deps} | ${t.status} | ${t.retries} | ${esc(t.summary)} | ${esc(t.description)} |`);
     }
+    const meta = {
+      startedAt: data.startedAt,
+      activeTaskIds: data.activeTaskIds
+    };
+    lines.push("");
+    lines.push(`<!-- meta: ${JSON.stringify(meta)} -->`);
     const p = (0, import_path.join)(this.root, "progress.md");
-    await (0, import_promises.writeFile)(p + ".tmp", lines.join("\n") + "\n", "utf-8");
-    await (0, import_promises.rename)(p + ".tmp", p);
+    const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+    await (0, import_promises.writeFile)(tmp, lines.join("\n") + "\n", "utf-8");
+    await (0, import_promises.rename)(tmp, p);
   }
   async loadProgress() {
     try {
       const raw = await (0, import_promises.readFile)((0, import_path.join)(this.root, "progress.md"), "utf-8");
       return this.parseProgress(raw);
-    } catch {
-      return null;
+    } catch (e) {
+      if (e.code === "ENOENT") return null;
+      throw new Error(`\u8BFB\u53D6 progress.md \u5931\u8D25: ${e.message}`);
     }
   }
   parseProgress(raw) {
@@ -317,15 +412,23 @@ var FsWorkflowRepository = class {
     const lines = raw.split("\n");
     const name = (lines[0] ?? "").replace(/^#\s*/, "").trim();
     let status = "idle";
-    let current = null;
+    let activeTaskIds = [];
+    let startedAt = 0;
     const tasks = [];
     for (const line of lines) {
       if (line.startsWith("\u72B6\u6001: ")) {
         const s = line.slice(4).trim();
         status = validWfStatus.has(s) ? s : "idle";
       }
-      if (line.startsWith("\u5F53\u524D: ")) current = line.slice(4).trim();
-      if (current === "\u65E0") current = null;
+      const metaMatch = line.match(/^<!-- meta: ({.*}) -->$/);
+      if (metaMatch) {
+        try {
+          const meta = JSON.parse(metaMatch[1]);
+          if (Array.isArray(meta.activeTaskIds)) activeTaskIds = meta.activeTaskIds;
+          if (typeof meta.startedAt === "number") startedAt = meta.startedAt;
+        } catch {
+        }
+      }
       const m = line.match(/^\|\s*(\d{3,})\s*\|\s*(.+?)\s*\|\s*(\w+)\s*\|\s*([^|]*?)\s*\|\s*(\w+)\s*\|\s*(\d+)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|$/);
       if (m) {
         const depsRaw = m[4].trim();
@@ -337,11 +440,13 @@ var FsWorkflowRepository = class {
           status: validTaskStatus.has(m[5]) ? m[5] : "pending",
           retries: parseInt(m[6], 10),
           summary: m[7] === "-" ? "" : m[7],
-          description: m[8] === "-" ? "" : m[8]
+          description: m[8] === "-" ? "" : m[8],
+          failHistory: [],
+          timestamps: { created: startedAt || Date.now() }
         });
       }
     }
-    return { name, status, current, tasks };
+    return { name, status, activeTaskIds, tasks, startedAt };
   }
   // --- context/ 任务详细产出 ---
   async clearContext() {
@@ -353,28 +458,32 @@ var FsWorkflowRepository = class {
   async saveTaskContext(taskId, content) {
     await this.ensure(this.ctxDir);
     const p = (0, import_path.join)(this.ctxDir, `task-${taskId}.md`);
-    await (0, import_promises.writeFile)(p + ".tmp", content, "utf-8");
-    await (0, import_promises.rename)(p + ".tmp", p);
+    const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+    await (0, import_promises.writeFile)(tmp, content, "utf-8");
+    await (0, import_promises.rename)(tmp, p);
   }
   async loadTaskContext(taskId) {
     try {
       return await (0, import_promises.readFile)((0, import_path.join)(this.ctxDir, `task-${taskId}.md`), "utf-8");
-    } catch {
-      return null;
+    } catch (e) {
+      if (e.code === "ENOENT") return null;
+      throw new Error(`\u8BFB\u53D6 task-${taskId}.md \u5931\u8D25: ${e.message}`);
     }
   }
   // --- summary.md ---
   async saveSummary(content) {
     await this.ensure(this.ctxDir);
     const p = (0, import_path.join)(this.ctxDir, "summary.md");
-    await (0, import_promises.writeFile)(p + ".tmp", content, "utf-8");
-    await (0, import_promises.rename)(p + ".tmp", p);
+    const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+    await (0, import_promises.writeFile)(tmp, content, "utf-8");
+    await (0, import_promises.rename)(tmp, p);
   }
   async loadSummary() {
     try {
       return await (0, import_promises.readFile)((0, import_path.join)(this.ctxDir, "summary.md"), "utf-8");
-    } catch {
-      return "";
+    } catch (e) {
+      if (e.code === "ENOENT") return "";
+      throw new Error(`\u8BFB\u53D6 summary.md \u5931\u8D25: ${e.message}`);
     }
   }
   // --- tasks.md ---
@@ -385,8 +494,9 @@ var FsWorkflowRepository = class {
   async loadTasks() {
     try {
       return await (0, import_promises.readFile)((0, import_path.join)(this.root, "tasks.md"), "utf-8");
-    } catch {
-      return null;
+    } catch (e) {
+      if (e.code === "ENOENT") return null;
+      throw new Error(`\u8BFB\u53D6 tasks.md \u5931\u8D25: ${e.message}`);
     }
   }
   async ensureClaudeMd() {
@@ -428,14 +538,120 @@ var FsWorkflowRepository = class {
     await (0, import_promises.writeFile)(path, JSON.stringify(settings, null, 2) + "\n", "utf-8");
     return true;
   }
+  // --- Git / Verify ---
   commit(taskId, title, summary, files) {
     return autoCommit(taskId, title, summary, files);
   }
   cleanup() {
-    gitCleanup();
+    gitDiscardInterruptedChanges();
   }
-  verify() {
-    return runVerify(this.base);
+  pruneStash(maxKeep = 5) {
+    pruneFlowpilotStash(maxKeep);
+  }
+  verify(config) {
+    return runVerify(this.base, config?.verifyCommands, config?.verifyTimeout);
+  }
+  // --- 配置 ---
+  async saveConfig(config) {
+    const p = (0, import_path.join)(this.root, "config.json");
+    await (0, import_promises.writeFile)(p, JSON.stringify(config, null, 2) + "\n", "utf-8");
+  }
+  async loadConfig() {
+    try {
+      const raw = await (0, import_promises.readFile)((0, import_path.join)(this.root, "config.json"), "utf-8");
+      return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
+    } catch {
+      return { ...DEFAULT_CONFIG };
+    }
+  }
+  // --- 执行历史 ---
+  async appendHistory(entry) {
+    const p = (0, import_path.join)(this.root, "history.jsonl");
+    const line = JSON.stringify(entry) + "\n";
+    await (0, import_promises.writeFile)(p, line, { flag: "a" });
+  }
+  async loadHistory() {
+    try {
+      const raw = await (0, import_promises.readFile)((0, import_path.join)(this.root, "history.jsonl"), "utf-8");
+      return raw.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    } catch (e) {
+      if (e.code === "ENOENT") return [];
+      throw e;
+    }
+  }
+  // --- CLAUDE.md 清理 ---
+  async removeClaudeMd() {
+    const p = (0, import_path.join)(this.base, "CLAUDE.md");
+    try {
+      const content = await (0, import_promises.readFile)(p, "utf-8");
+      const cleaned = content.replace(
+        /\n*<!-- flowpilot:start -->[\s\S]*?<!-- flowpilot:end -->\n*/g,
+        "\n"
+      );
+      const final = cleaned.replace(
+        /\n*<!-- flowpilot:watermark -->[\s\S]*?<!-- flowpilot:watermark:end -->\n*/g,
+        "\n"
+      );
+      await (0, import_promises.writeFile)(p, final.trimEnd() + "\n", "utf-8");
+    } catch {
+    }
+  }
+  // --- Hooks 清理 ---
+  async removeHooks() {
+    const p = (0, import_path.join)(this.base, ".claude", "settings.json");
+    try {
+      const raw = await (0, import_promises.readFile)(p, "utf-8");
+      const settings = JSON.parse(raw);
+      const pre = settings.hooks?.PreToolUse;
+      if (Array.isArray(pre)) {
+        settings.hooks.PreToolUse = pre.filter(
+          (h) => !h.hooks?.[0]?.prompt?.includes?.("FlowPilot")
+        );
+        if (!settings.hooks.PreToolUse.length) delete settings.hooks.PreToolUse;
+        if (!Object.keys(settings.hooks || {}).length) delete settings.hooks;
+      }
+      await (0, import_promises.writeFile)(p, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+    } catch {
+    }
+  }
+  // --- 心跳（Compact 恢复） ---
+  async saveHeartbeat(data) {
+    const p = (0, import_path.join)(this.root, "heartbeat.json");
+    await (0, import_promises.writeFile)(p, JSON.stringify(data) + "\n", "utf-8");
+  }
+  async loadHeartbeat() {
+    try {
+      const raw = await (0, import_promises.readFile)((0, import_path.join)(this.root, "heartbeat.json"), "utf-8");
+      return JSON.parse(raw);
+    } catch (e) {
+      if (e.code === "ENOENT") return null;
+      return null;
+    }
+  }
+  // --- CLAUDE.md 状态水印 ---
+  async updateWatermark(info) {
+    const p = (0, import_path.join)(this.base, "CLAUDE.md");
+    try {
+      let content = await (0, import_promises.readFile)(p, "utf-8");
+      const watermark = `<!-- flowpilot:watermark -->
+${info}
+<!-- flowpilot:watermark:end -->`;
+      if (content.includes("<!-- flowpilot:watermark -->")) {
+        content = content.replace(
+          /<!-- flowpilot:watermark -->[\s\S]*?<!-- flowpilot:watermark:end -->/,
+          watermark
+        );
+      } else if (content.includes("<!-- flowpilot:end -->")) {
+        content = content.replace(
+          "<!-- flowpilot:end -->",
+          "<!-- flowpilot:end -->\n\n" + watermark
+        );
+      } else {
+        content += "\n\n" + watermark + "\n";
+      }
+      await (0, import_promises.writeFile)(p, content, "utf-8");
+    } catch {
+    }
   }
 };
 
@@ -518,36 +734,41 @@ function completeTask(data, id, summary) {
   if (!t) throw new Error(`\u4EFB\u52A1 ${id} \u4E0D\u5B58\u5728`);
   t.status = "done";
   t.summary = summary;
-  data.current = null;
+  t.timestamps.completed = Date.now();
+  data.activeTaskIds = data.activeTaskIds.filter((x) => x !== id);
 }
-function failTask(data, id) {
+function failTask(data, id, reason) {
   const t = data.tasks.find((x) => x.id === id);
   if (!t) throw new Error(`\u4EFB\u52A1 ${id} \u4E0D\u5B58\u5728`);
   t.retries++;
+  t.timestamps.lastFailed = Date.now();
+  if (reason) {
+    t.failHistory.push(`[\u7B2C${t.retries}\u6B21] ${reason}`);
+  }
+  data.activeTaskIds = data.activeTaskIds.filter((x) => x !== id);
   if (t.retries >= 3) {
     t.status = "failed";
-    data.current = null;
     return "skip";
   }
   t.status = "pending";
-  data.current = null;
   return "retry";
 }
 function resumeProgress(data) {
-  let firstId = null;
+  const resetIds = [];
   for (const t of data.tasks) {
     if (t.status === "active") {
       t.status = "pending";
-      if (!firstId) firstId = t.id;
+      t.timestamps.started = void 0;
+      resetIds.push(t.id);
     }
   }
-  if (firstId) {
-    data.current = null;
+  if (resetIds.length) {
+    data.activeTaskIds = [];
     data.status = "running";
-    return firstId;
+    return resetIds;
   }
-  if (data.status === "running") return data.current;
-  return null;
+  if (data.status === "running") return [];
+  return [];
 }
 function findParallelTasks(tasks) {
   const pending = tasks.filter((t) => t.status === "pending");
@@ -567,8 +788,9 @@ function isAllDone(tasks) {
 }
 
 // src/infrastructure/markdown-parser.ts
-var TASK_RE = /^(\d+)\.\s+\[\s*(\w+)\s*\]\s+(.+?)(?:\s*\((?:deps?|依赖)\s*:\s*([^)]*)\))?\s*$/i;
-var DESC_RE = /^\s{2,}(.+)$/;
+var TASK_WITH_DEPS_RE = /^(\d+)\.\s+\[\s*([\w-]+)\s*\]\s+(.+)\s+\((?:deps?|依赖)\s*:\s*([^)]*)\)\s*$/i;
+var TASK_NO_DEPS_RE = /^(\d+)\.\s+\[\s*([\w-]+)\s*\]\s+(.+?)\s*$/i;
+var DESC_RE = /^(?:\t|\s{2,})(.+)$/;
 function parseTasksMarkdown(markdown) {
   const lines = markdown.split("\n");
   let name = "";
@@ -581,11 +803,11 @@ function parseTasksMarkdown(markdown) {
       name = line.slice(2).trim();
       continue;
     }
-    if (name && !description && !line.startsWith("#") && line.trim() && !TASK_RE.test(line)) {
+    if (name && !description && !line.startsWith("#") && line.trim() && !TASK_WITH_DEPS_RE.test(line) && !TASK_NO_DEPS_RE.test(line)) {
       description = line.trim();
       continue;
     }
-    const m = line.match(TASK_RE);
+    const m = line.match(TASK_WITH_DEPS_RE) || line.match(TASK_NO_DEPS_RE);
     if (m) {
       const userNum = m[1];
       const sysId = makeTaskId(tasks.length + 1);
@@ -609,11 +831,40 @@ function parseTasksMarkdown(markdown) {
   }
   return { name, description, tasks };
 }
+function validateDefinition(def) {
+  const warnings = [];
+  if (!def.name) {
+    warnings.push({ type: "error", message: "\u7F3A\u5C11\u5DE5\u4F5C\u6D41\u540D\u79F0\uFF08\u9700\u8981 # \u6807\u9898\uFF09" });
+  }
+  if (!def.tasks.length) {
+    warnings.push({ type: "error", message: "\u672A\u89E3\u6790\u5230\u4EFB\u4F55\u4EFB\u52A1\uFF0C\u8BF7\u68C0\u67E5\u683C\u5F0F: N. [type] \u6807\u9898" });
+  }
+  const validIds = new Set(def.tasks.map((_, i) => makeTaskId(i + 1)));
+  for (let i = 0; i < def.tasks.length; i++) {
+    const t = def.tasks[i];
+    const taskId = makeTaskId(i + 1);
+    for (const d of t.deps) {
+      if (!validIds.has(d)) {
+        warnings.push({ type: "error", message: `\u4EFB\u52A1 ${taskId} "${t.title}" \u4F9D\u8D56\u4E0D\u5B58\u5728\u7684\u4EFB\u52A1 ID: ${d}` });
+      }
+    }
+    if (t.deps.includes(taskId)) {
+      warnings.push({ type: "error", message: `\u4EFB\u52A1 ${taskId} "${t.title}" \u4E0D\u80FD\u4F9D\u8D56\u81EA\u5DF1` });
+    }
+    const uniqueDeps = new Set(t.deps);
+    if (uniqueDeps.size < t.deps.length) {
+      warnings.push({ type: "warning", message: `\u4EFB\u52A1 ${taskId} "${t.title}" \u6709\u91CD\u590D\u7684\u4F9D\u8D56\u58F0\u660E` });
+    }
+  }
+  return warnings;
+}
 
 // src/application/workflow-service.ts
 var WorkflowService = class {
-  constructor(repo2, parse) {
+  constructor(repo2, git, verifier, parse) {
     this.repo = repo2;
+    this.git = git;
+    this.verifier = verifier;
     this.parse = parse;
   }
   /** init: 解析任务markdown → 生成progress/tasks */
@@ -623,6 +874,12 @@ var WorkflowService = class {
       throw new Error(`\u5DF2\u6709\u8FDB\u884C\u4E2D\u7684\u5DE5\u4F5C\u6D41: ${existing.name}\uFF0C\u4F7F\u7528 --force \u8986\u76D6`);
     }
     const def = this.parse(tasksMd);
+    const warnings = validateDefinition(def);
+    const errors = warnings.filter((w) => w.type === "error");
+    if (errors.length) {
+      throw new Error(`\u4EFB\u52A1\u5B9A\u4E49\u9519\u8BEF:
+${errors.map((e) => `- ${e.message}`).join("\n")}`);
+    }
     const tasks = def.tasks.map((t, i) => ({
       id: makeTaskId(i + 1),
       title: t.title,
@@ -631,13 +888,16 @@ var WorkflowService = class {
       status: "pending",
       deps: t.deps,
       summary: "",
-      retries: 0
+      retries: 0,
+      failHistory: [],
+      timestamps: { created: Date.now() }
     }));
     const data = {
       name: def.name,
       status: "running",
-      current: null,
-      tasks
+      activeTaskIds: [],
+      tasks,
+      startedAt: Date.now()
     };
     await this.repo.saveProgress(data);
     await this.repo.saveTasks(tasksMd);
@@ -647,17 +907,19 @@ ${def.description}
 `);
     await this.repo.ensureClaudeMd();
     await this.repo.ensureHooks();
+    await this.repo.saveConfig(DEFAULT_CONFIG);
+    await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "init", detail: data.name });
     return data;
   }
   /** next: 获取下一个可执行任务（含依赖上下文） */
   async next() {
-    await this.repo.lock();
+    const config = await this.repo.loadConfig();
+    await this.repo.lock(config.lockTimeout);
     try {
       const data = await this.requireProgress();
       if (isAllDone(data.tasks)) return null;
-      const active = data.tasks.filter((t) => t.status === "active");
-      if (active.length) {
-        throw new Error(`\u6709 ${active.length} \u4E2A\u4EFB\u52A1\u4ECD\u4E3A active \u72B6\u6001\uFF08${active.map((t) => t.id).join(",")}\uFF09\uFF0C\u8BF7\u5148\u6267\u884C node flow.js status \u68C0\u67E5\u5E76\u8865 checkpoint\uFF0C\u6216 node flow.js resume \u91CD\u7F6E`);
+      if (data.activeTaskIds.length > 0) {
+        throw new Error(`\u6709 ${data.activeTaskIds.length} \u4E2A\u4EFB\u52A1\u4ECD\u4E3A active \u72B6\u6001\uFF08${data.activeTaskIds.join(",")}\uFF09\uFF0C\u8BF7\u5148\u6267\u884C node flow.js status \u68C0\u67E5\u5E76\u8865 checkpoint\uFF0C\u6216 node flow.js resume \u91CD\u7F6E`);
       }
       const task = findNextTask(data.tasks);
       if (!task) {
@@ -665,8 +927,12 @@ ${def.description}
         return null;
       }
       task.status = "active";
-      data.current = task.id;
+      task.timestamps.started = Date.now();
+      data.activeTaskIds.push(task.id);
       await this.repo.saveProgress(data);
+      await this.repo.saveHeartbeat({ lastCommand: "next", timestamp: (/* @__PURE__ */ new Date()).toISOString(), activeTaskIds: data.activeTaskIds });
+      await this.repo.updateWatermark(`active: ${data.activeTaskIds.join(",")}`);
+      await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "next", taskId: task.id, detail: task.title });
       const parts = [];
       const summary = await this.repo.loadSummary();
       if (summary) parts.push(summary);
@@ -681,22 +947,31 @@ ${def.description}
   }
   /** nextBatch: 获取所有可并行执行的任务 */
   async nextBatch() {
-    await this.repo.lock();
+    const config = await this.repo.loadConfig();
+    await this.repo.lock(config.lockTimeout);
     try {
       const data = await this.requireProgress();
       if (isAllDone(data.tasks)) return [];
-      const active = data.tasks.filter((t) => t.status === "active");
-      if (active.length) {
-        throw new Error(`\u6709 ${active.length} \u4E2A\u4EFB\u52A1\u4ECD\u4E3A active \u72B6\u6001\uFF08${active.map((t) => t.id).join(",")}\uFF09\uFF0C\u8BF7\u5148\u6267\u884C node flow.js status \u68C0\u67E5\u5E76\u8865 checkpoint\uFF0C\u6216 node flow.js resume \u91CD\u7F6E`);
+      if (data.activeTaskIds.length > 0) {
+        throw new Error(`\u6709 ${data.activeTaskIds.length} \u4E2A\u4EFB\u52A1\u4ECD\u4E3A active \u72B6\u6001\uFF08${data.activeTaskIds.join(",")}\uFF09\uFF0C\u8BF7\u5148\u6267\u884C node flow.js status \u68C0\u67E5\u5E76\u8865 checkpoint\uFF0C\u6216 node flow.js resume \u91CD\u7F6E`);
       }
-      const tasks = findParallelTasks(data.tasks);
+      let tasks = findParallelTasks(data.tasks);
       if (!tasks.length) {
         await this.repo.saveProgress(data);
         return [];
       }
-      for (const t of tasks) t.status = "active";
-      data.current = tasks[0].id;
+      if (config.maxParallel && tasks.length > config.maxParallel) {
+        tasks = tasks.slice(0, config.maxParallel);
+      }
+      for (const t of tasks) {
+        t.status = "active";
+        t.timestamps.started = Date.now();
+        data.activeTaskIds.push(t.id);
+      }
       await this.repo.saveProgress(data);
+      await this.repo.saveHeartbeat({ lastCommand: "next", timestamp: (/* @__PURE__ */ new Date()).toISOString(), activeTaskIds: data.activeTaskIds });
+      await this.repo.updateWatermark(`active: ${data.activeTaskIds.join(",")}`);
+      await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "next", detail: `batch: ${tasks.map((t) => t.id).join(",")}` });
       const summary = await this.repo.loadSummary();
       const results = [];
       for (const task of tasks) {
@@ -724,8 +999,16 @@ ${def.description}
         throw new Error(`\u4EFB\u52A1 ${id} \u72B6\u6001\u4E3A ${task.status}\uFF0C\u53EA\u6709 active \u72B6\u6001\u53EF\u4EE5 checkpoint`);
       }
       if (detail === "FAILED") {
-        const result = failTask(data, id);
+        const reason = detail;
+        const result = failTask(data, id, reason);
+        await this.repo.saveTaskContext(id, `# task-${id}: ${task.title}
+
+[FAILED] \u7B2C${task.retries}\u6B21\u5931\u8D25
+`);
         await this.repo.saveProgress(data);
+        await this.repo.saveHeartbeat({ lastCommand: "checkpoint", timestamp: (/* @__PURE__ */ new Date()).toISOString(), activeTaskIds: data.activeTaskIds });
+        await this.repo.updateWatermark(`active: ${data.activeTaskIds.join(",") || "\u65E0"}`);
+        await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "fail", taskId: id, detail: `\u7B2C${task.retries}\u6B21\u5931\u8D25` });
         return result === "retry" ? `\u4EFB\u52A1 ${id} \u5931\u8D25(\u7B2C${task.retries}\u6B21)\uFF0C\u5C06\u91CD\u8BD5` : `\u4EFB\u52A1 ${id} \u8FDE\u7EED\u5931\u8D253\u6B21\uFF0C\u5DF2\u8DF3\u8FC7`;
       }
       if (!detail.trim()) throw new Error(`\u4EFB\u52A1 ${id} checkpoint\u5185\u5BB9\u4E0D\u80FD\u4E3A\u7A7A`);
@@ -737,16 +1020,23 @@ ${def.description}
 ${detail}
 `);
       await this.updateSummary(data);
-      const commitErr = this.repo.commit(id, task.title, summaryLine, files);
-      const doneCount = data.tasks.filter((t) => t.status === "done").length;
-      let msg = `\u4EFB\u52A1 ${id} \u5B8C\u6210 (${doneCount}/${data.tasks.length})`;
-      if (commitErr) {
-        msg += `
+      const config = await this.repo.loadConfig();
+      let commitMsg = "";
+      if (config.autoCommit) {
+        const commitErr = this.git.commit(id, task.title, summaryLine, files);
+        if (commitErr) {
+          commitMsg = `
 [git\u63D0\u4EA4\u5931\u8D25] ${commitErr}
 \u8BF7\u6839\u636E\u9519\u8BEF\u4FEE\u590D\u540E\u624B\u52A8\u6267\u884C git add -A && git commit`;
-      } else {
-        msg += " [\u5DF2\u81EA\u52A8\u63D0\u4EA4]";
+        } else {
+          commitMsg = " [\u5DF2\u81EA\u52A8\u63D0\u4EA4]";
+        }
       }
+      await this.repo.saveHeartbeat({ lastCommand: "checkpoint", timestamp: (/* @__PURE__ */ new Date()).toISOString(), activeTaskIds: data.activeTaskIds });
+      await this.repo.updateWatermark(`active: ${data.activeTaskIds.join(",") || "\u65E0"}`);
+      await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "checkpoint", taskId: id, detail: summaryLine });
+      const doneCount = data.tasks.filter((t) => t.status === "done").length;
+      let msg = `\u4EFB\u52A1 ${id} \u5B8C\u6210 (${doneCount}/${data.tasks.length})${commitMsg}`;
       return isAllDone(data.tasks) ? msg + "\n\u5168\u90E8\u4EFB\u52A1\u5DF2\u5B8C\u6210\uFF0C\u8BF7\u6267\u884C node flow.js finish \u8FDB\u884C\u6536\u5C3E" : msg;
     } finally {
       await this.repo.unlock();
@@ -754,45 +1044,84 @@ ${detail}
   }
   /** resume: 中断恢复 */
   async resume() {
-    const data = await this.repo.loadProgress();
-    if (!data) return "\u65E0\u6D3B\u8DC3\u5DE5\u4F5C\u6D41\uFF0C\u7B49\u5F85\u9700\u6C42\u8F93\u5165";
-    if (data.status === "idle") return "\u5DE5\u4F5C\u6D41\u5F85\u547D\u4E2D\uFF0C\u7B49\u5F85\u9700\u6C42\u8F93\u5165";
-    if (data.status === "completed") return "\u5DE5\u4F5C\u6D41\u5DF2\u5168\u90E8\u5B8C\u6210";
-    if (data.status === "finishing") return `\u6062\u590D\u5DE5\u4F5C\u6D41: ${data.name}
-\u6B63\u5728\u6536\u5C3E\u9636\u6BB5\uFF0C\u8BF7\u6267\u884C node flow.js finish`;
-    const resetId = resumeProgress(data);
-    await this.repo.saveProgress(data);
-    if (resetId) this.repo.cleanup();
-    const doneCount = data.tasks.filter((t) => t.status === "done").length;
-    const total = data.tasks.length;
-    if (resetId) {
-      return `\u6062\u590D\u5DE5\u4F5C\u6D41: ${data.name}
-\u8FDB\u5EA6: ${doneCount}/${total}
-\u4E2D\u65AD\u4EFB\u52A1 ${resetId} \u5DF2\u91CD\u7F6E\uFF0C\u5C06\u91CD\u65B0\u6267\u884C`;
+    await this.repo.lock();
+    try {
+      const data = await this.repo.loadProgress();
+      if (!data || data.status !== "running" && data.status !== "idle") {
+        if (data?.status === "finishing") {
+          return "\u6B63\u5728\u6536\u5C3E\u9636\u6BB5\uFF0C\u8BF7\u6267\u884C node flow.js finish";
+        }
+        return "\u6CA1\u6709\u9700\u8981\u6062\u590D\u7684\u5DE5\u4F5C\u6D41\uFF0C\u4F7F\u7528 flow init \u5F00\u59CB\u65B0\u6D41\u7A0B";
+      }
+      if (data.status === "idle") {
+        data.status = "running";
+        await this.repo.saveProgress(data);
+      }
+      const resetIds = resumeProgress(data);
+      await this.repo.saveProgress(data);
+      if (resetIds.length) {
+        this.git.cleanup();
+        this.git.pruneStash();
+      }
+      const summary = await this.repo.loadSummary();
+      const doneCount = data.tasks.filter((t) => t.status === "done").length;
+      const total = data.tasks.length;
+      const lines = [
+        `\u6062\u590D\u5DE5\u4F5C\u6D41: ${data.name}`,
+        `\u8FDB\u5EA6: ${doneCount}/${total}`
+      ];
+      if (resetIds.length) {
+        lines.push(`\u4E2D\u65AD\u4EFB\u52A1 ${resetIds.join(", ")} \u5DF2\u91CD\u7F6E\uFF0C\u5C06\u91CD\u65B0\u6267\u884C`);
+      } else {
+        lines.push("\u7EE7\u7EED\u6267\u884C");
+      }
+      lines.push("");
+      lines.push("--- \u4EFB\u52A1\u72B6\u6001 ---");
+      for (const t of data.tasks) {
+        const icon = { pending: "[ ]", active: "[>]", done: "[x]", skipped: "[-]", failed: "[!]" }[t.status] || "[ ]";
+        lines.push(`${icon} ${t.id} [${t.type}] ${t.title}${t.summary ? " - " + t.summary : ""}`);
+      }
+      if (summary) {
+        lines.push("");
+        lines.push("--- \u9879\u76EE\u6458\u8981 ---");
+        lines.push(summary);
+      }
+      lines.push("");
+      lines.push("\u8BF7\u6267\u884C node flow.js next --batch \u7EE7\u7EED");
+      await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "resume", detail: `\u91CD\u7F6E: ${resetIds.join(",") || "\u65E0"}` });
+      await this.repo.saveHeartbeat({ lastCommand: "resume", timestamp: (/* @__PURE__ */ new Date()).toISOString(), activeTaskIds: [] });
+      return lines.join("\n");
+    } finally {
+      this.repo.unlock();
     }
-    return `\u6062\u590D\u5DE5\u4F5C\u6D41: ${data.name}
-\u8FDB\u5EA6: ${doneCount}/${total}
-\u7EE7\u7EED\u6267\u884C`;
   }
   /** add: 追加任务 */
-  async add(title, type) {
+  async add(title, type, description = "", deps = []) {
     await this.repo.lock();
     try {
       const data = await this.requireProgress();
       const maxNum = data.tasks.reduce((m, t) => Math.max(m, parseInt(t.id, 10)), 0);
       const id = makeTaskId(maxNum + 1);
+      for (const d of deps) {
+        if (!data.tasks.find((t) => t.id === d)) {
+          throw new Error(`\u4F9D\u8D56\u4EFB\u52A1 ${d} \u4E0D\u5B58\u5728`);
+        }
+      }
       data.tasks.push({
         id,
         title,
-        description: "",
+        description,
         type,
         status: "pending",
-        deps: [],
+        deps,
         summary: "",
-        retries: 0
+        retries: 0,
+        failHistory: [],
+        timestamps: { created: Date.now() }
       });
       await this.repo.saveProgress(data);
-      return `\u5DF2\u8FFD\u52A0\u4EFB\u52A1 ${id}: ${title} [${type}]`;
+      await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "add", taskId: id, detail: title });
+      return `\u5DF2\u6DFB\u52A0\u4EFB\u52A1 ${id}: ${title}`;
     } finally {
       await this.repo.unlock();
     }
@@ -808,8 +1137,9 @@ ${detail}
       const warn = task.status === "active" ? "\uFF08\u8B66\u544A: \u8BE5\u4EFB\u52A1\u4E3A active \u72B6\u6001\uFF0C\u5B50Agent\u53EF\u80FD\u4ECD\u5728\u8FD0\u884C\uFF09" : "";
       task.status = "skipped";
       task.summary = "\u624B\u52A8\u8DF3\u8FC7";
-      data.current = null;
+      data.activeTaskIds = data.activeTaskIds.filter((x) => x !== id);
       await this.repo.saveProgress(data);
+      await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "skip", taskId: id, detail: task.title });
       return `\u5DF2\u8DF3\u8FC7\u4EFB\u52A1 ${id}: ${task.title}${warn}`;
     } finally {
       await this.repo.unlock();
@@ -841,79 +1171,182 @@ ${detail}
   }
   /** review: 标记已通过code-review，解锁finish */
   async review() {
-    const data = await this.requireProgress();
-    if (!isAllDone(data.tasks)) throw new Error("\u8FD8\u6709\u672A\u5B8C\u6210\u7684\u4EFB\u52A1\uFF0C\u8BF7\u5148\u5B8C\u6210\u6240\u6709\u4EFB\u52A1");
-    if (data.status === "finishing") return "\u5DF2\u5904\u4E8Ereview\u901A\u8FC7\u72B6\u6001\uFF0C\u53EF\u4EE5\u6267\u884C node flow.js finish";
-    data.status = "finishing";
-    await this.repo.saveProgress(data);
-    return "\u4EE3\u7801\u5BA1\u67E5\u5DF2\u901A\u8FC7\uFF0C\u8BF7\u6267\u884C node flow.js finish \u5B8C\u6210\u6536\u5C3E";
+    await this.repo.lock();
+    try {
+      const data = await this.requireProgress();
+      if (data.status !== "finishing") return "\u5F53\u524D\u4E0D\u5728 finishing \u9636\u6BB5";
+      data.reviewDone = true;
+      await this.repo.saveProgress(data);
+      return "Code review \u5DF2\u6807\u8BB0\u5B8C\u6210\uFF0C\u8BF7\u6267\u884C node flow.js finish \u5B8C\u6210\u6536\u5C3E";
+    } finally {
+      this.repo.unlock();
+    }
   }
   /** finish: 智能收尾 - 先verify，review后置 */
   async finish() {
-    const data = await this.requireProgress();
-    if (data.status === "idle" || data.status === "completed") return "\u5DE5\u4F5C\u6D41\u5DF2\u5B8C\u6210\uFF0C\u65E0\u9700\u91CD\u590Dfinish";
-    if (!isAllDone(data.tasks)) throw new Error("\u8FD8\u6709\u672A\u5B8C\u6210\u7684\u4EFB\u52A1\uFF0C\u8BF7\u5148\u5B8C\u6210\u6240\u6709\u4EFB\u52A1");
-    const result = this.repo.verify();
+    await this.repo.lock();
+    let data;
+    let config;
+    try {
+      data = await this.requireProgress();
+      config = await this.repo.loadConfig();
+      if (data.status === "idle" || data.status === "completed") return "\u6CA1\u6709\u6D3B\u8DC3\u7684\u5DE5\u4F5C\u6D41";
+      if (!isAllDone(data.tasks)) return "\u8FD8\u6709\u672A\u5B8C\u6210\u7684\u4EFB\u52A1\uFF0C\u8BF7\u5148\u5B8C\u6210\u6240\u6709\u4EFB\u52A1";
+      if (data.status !== "finishing") {
+        data.status = "finishing";
+        await this.repo.saveProgress(data);
+      }
+    } finally {
+      this.repo.unlock();
+    }
+    const result = this.verifier.verify(config);
     if (!result.passed) {
-      return `\u9A8C\u8BC1\u5931\u8D25: ${result.error}
-\u8BF7\u4FEE\u590D\u540E\u91CD\u65B0\u6267\u884C node flow.js finish`;
-    }
-    if (data.status !== "finishing") {
-      return "\u9A8C\u8BC1\u901A\u8FC7\uFF0C\u8BF7\u6D3E\u5B50Agent\u6267\u884C code-review\uFF0C\u5B8C\u6210\u540E\u6267\u884C node flow.js review\uFF0C\u518D\u6267\u884C node flow.js finish";
-    }
-    const done = data.tasks.filter((t) => t.status === "done");
-    const skipped = data.tasks.filter((t) => t.status === "skipped");
-    const failed = data.tasks.filter((t) => t.status === "failed");
-    const stats = [`${done.length} done`, skipped.length ? `${skipped.length} skipped` : "", failed.length ? `${failed.length} failed` : ""].filter(Boolean).join(", ");
-    const titles = done.map((t) => `- ${t.id}: ${t.title}`).join("\n");
-    const commitErr = this.repo.commit("finish", data.name || "\u5DE5\u4F5C\u6D41\u5B8C\u6210", `${stats}
+      return `\u9A8C\u8BC1\u5931\u8D25:
+${result.error}
 
-${titles}`);
-    if (!commitErr) {
+\u6267\u884C\u7684\u811A\u672C: ${result.scripts.join(", ")}
+\u8BF7\u4FEE\u590D\u540E\u91CD\u8BD5 finish`;
+    }
+    await this.repo.lock();
+    try {
+      data = await this.requireProgress();
+      if (!data.reviewDone) {
+        data.status = "finishing";
+        await this.repo.saveProgress(data);
+        return "\u9A8C\u8BC1\u901A\u8FC7\uFF0C\u8BF7\u6D3E\u5B50Agent\u6267\u884C code-review\n\u5B8C\u6210\u540E\u6267\u884C node flow.js review \u6807\u8BB0";
+      }
+      const done = data.tasks.filter((t) => t.status === "done").length;
+      const skipped = data.tasks.filter((t) => t.status === "skipped").length;
+      const failed = data.tasks.filter((t) => t.status === "failed").length;
+      if (config.autoCommit) {
+        const commitErr = this.git.commit("finish", data.name, `\u5B8C\u6210: ${done}/${data.tasks.length}`);
+        if (commitErr) {
+          return `\u9A8C\u8BC1\u901A\u8FC7\u4F46git\u63D0\u4EA4\u5931\u8D25: ${commitErr}`;
+        }
+      }
+      await this.repo.removeClaudeMd();
+      await this.repo.removeHooks();
       await this.repo.clearAll();
+      await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "finish", detail: `done=${done} skipped=${skipped} failed=${failed}` });
+      return `\u5DE5\u4F5C\u6D41\u5B8C\u6210\uFF01
+\u5B8C\u6210: ${done} | \u8DF3\u8FC7: ${skipped} | \u5931\u8D25: ${failed}
+\u9A8C\u8BC1: ${result.scripts.join(", ") || "\u65E0"}`;
+    } finally {
+      this.repo.unlock();
     }
-    const scripts = result.scripts.length ? result.scripts.join(", ") : "\u65E0\u9A8C\u8BC1\u811A\u672C";
-    if (commitErr) {
-      return `\u9A8C\u8BC1\u901A\u8FC7: ${scripts}
-${stats}
-[git\u63D0\u4EA4\u5931\u8D25] ${commitErr}
-\u8BF7\u6839\u636E\u9519\u8BEF\u4FEE\u590D\u540E\u624B\u52A8\u6267\u884C git add -A && git commit`;
-    }
-    return `\u9A8C\u8BC1\u901A\u8FC7: ${scripts}
-${stats}
-\u5DF2\u63D0\u4EA4\u6700\u7EC8commit\uFF0C\u5DE5\u4F5C\u6D41\u56DE\u5230\u5F85\u547D\u72B6\u6001
-\u7B49\u5F85\u4E0B\u4E00\u4E2A\u9700\u6C42...`;
   }
   /** status: 全局进度 */
   async status() {
     return this.repo.loadProgress();
   }
-  /** 滚动摘要：每次checkpoint追加，每10个任务压缩 */
+  /** edit: 编辑 pending 状态的任务 */
+  async edit(id, updates) {
+    await this.repo.lock();
+    try {
+      const data = await this.requireProgress();
+      const task = data.tasks.find((t) => t.id === id);
+      if (!task) throw new Error(`\u4EFB\u52A1 ${id} \u4E0D\u5B58\u5728`);
+      if (task.status !== "pending") throw new Error(`\u53EA\u80FD\u7F16\u8F91 pending \u72B6\u6001\u7684\u4EFB\u52A1\uFF08\u5F53\u524D: ${task.status}\uFF09`);
+      if (updates.title) task.title = updates.title;
+      if (updates.description !== void 0) task.description = updates.description;
+      if (updates.type) task.type = updates.type;
+      if (updates.deps) {
+        for (const d of updates.deps) {
+          if (!data.tasks.find((t) => t.id === d)) throw new Error(`\u4F9D\u8D56\u4EFB\u52A1 ${d} \u4E0D\u5B58\u5728`);
+          if (d === id) throw new Error("\u4E0D\u80FD\u4F9D\u8D56\u81EA\u5DF1");
+        }
+        task.deps = updates.deps;
+      }
+      await this.repo.saveProgress(data);
+      await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "edit", taskId: id, detail: JSON.stringify(updates) });
+      return `\u5DF2\u66F4\u65B0\u4EFB\u52A1 ${id}`;
+    } finally {
+      this.repo.unlock();
+    }
+  }
+  /** log: 查看执行历史 */
+  async log() {
+    const history = await this.repo.loadHistory();
+    if (!history.length) return "\u6682\u65E0\u6267\u884C\u5386\u53F2";
+    const lines = ["=== \u6267\u884C\u5386\u53F2 ===", ""];
+    for (const h of history.slice(-30)) {
+      const taskPart = h.taskId ? ` [${h.taskId}]` : "";
+      lines.push(`${h.ts} ${h.event}${taskPart} ${h.detail}`);
+    }
+    return lines.join("\n");
+  }
+  /** show: 查看任务详情 */
+  async show(id) {
+    const data = await this.requireProgress();
+    const task = data.tasks.find((t) => t.id === id);
+    if (!task) throw new Error(`\u4EFB\u52A1 ${id} \u4E0D\u5B58\u5728`);
+    const context = await this.repo.loadTaskContext(id);
+    const lines = [
+      `=== \u4EFB\u52A1 ${id} \u8BE6\u60C5 ===`,
+      `\u6807\u9898: ${task.title}`,
+      `\u7C7B\u578B: ${task.type}`,
+      `\u72B6\u6001: ${task.status}`,
+      `\u4F9D\u8D56: ${task.deps.length ? task.deps.join(", ") : "\u65E0"}`,
+      `\u91CD\u8BD5: ${task.retries}/${3}`
+    ];
+    if (task.description) lines.push(`\u63CF\u8FF0: ${task.description}`);
+    if (task.summary) lines.push(`\u6458\u8981: ${task.summary}`);
+    if (task.timestamps.started) lines.push(`\u5F00\u59CB: ${new Date(task.timestamps.started).toISOString()}`);
+    if (task.timestamps.completed) lines.push(`\u5B8C\u6210: ${new Date(task.timestamps.completed).toISOString()}`);
+    if (task.failHistory.length) {
+      lines.push("", "--- \u5931\u8D25\u8BB0\u5F55 ---");
+      task.failHistory.forEach((f) => lines.push(`  ${f}`));
+    }
+    if (context) {
+      lines.push("", "--- \u4EA7\u51FA\u4E0A\u4E0B\u6587 ---", context);
+    }
+    return lines.join("\n");
+  }
+  /** pause: 手动暂停工作流 */
+  async pause() {
+    await this.repo.lock();
+    try {
+      const data = await this.requireProgress();
+      if (data.status !== "running") return "\u6CA1\u6709\u8FD0\u884C\u4E2D\u7684\u5DE5\u4F5C\u6D41";
+      for (const t of data.tasks) {
+        if (t.status === "active") {
+          t.status = "pending";
+          t.timestamps.started = void 0;
+        }
+      }
+      data.activeTaskIds = [];
+      data.status = "idle";
+      await this.repo.saveProgress(data);
+      await this.repo.appendHistory({ ts: (/* @__PURE__ */ new Date()).toISOString(), event: "pause", detail: "\u624B\u52A8\u6682\u505C" });
+      return "\u5DE5\u4F5C\u6D41\u5DF2\u6682\u505C\uFF0C\u4F7F\u7528 resume \u7EE7\u7EED";
+    } finally {
+      this.repo.unlock();
+    }
+  }
+  /** 滚动摘要：每次checkpoint追加，压缩策略使用 config 阈值 */
   async updateSummary(data) {
+    const config = await this.repo.loadConfig();
     const done = data.tasks.filter((t) => t.status === "done");
     const lines = [`# ${data.name}
 `];
-    if (done.length > 10) {
+    if (done.length > config.summaryCompressThreshold) {
       const groups = /* @__PURE__ */ new Map();
       for (const t of done) {
         const arr = groups.get(t.type) || [];
-        arr.push(t.title);
+        arr.push(t);
         groups.set(t.type, arr);
       }
-      lines.push("## \u5DF2\u5B8C\u6210\u6A21\u5757");
-      for (const [type, titles] of groups) {
-        lines.push(`- [${type}] ${titles.length}\u9879: ${titles.slice(-3).join(", ")}${titles.length > 3 ? " \u7B49" : ""}`);
+      for (const [type, tasks] of groups) {
+        lines.push(`## ${type} (${tasks.length}\u9879\u5B8C\u6210)`);
+        for (const t of tasks) {
+          lines.push(`- ${t.id}: ${t.title} \u2192 ${t.summary}`);
+        }
+        lines.push("");
       }
     } else {
-      lines.push("## \u5DF2\u5B8C\u6210");
       for (const t of done) {
-        lines.push(`- [${t.type}] ${t.title}: ${t.summary}`);
+        lines.push(`- [${t.type}] ${t.id}: ${t.title}: ${t.summary}`);
       }
-    }
-    const pending = data.tasks.filter((t) => t.status !== "done" && t.status !== "skipped" && t.status !== "failed");
-    if (pending.length) {
-      lines.push("\n## \u5F85\u5B8C\u6210");
-      for (const t of pending) lines.push(`- [${t.type}] ${t.title}`);
     }
     await this.repo.saveSummary(lines.join("\n") + "\n");
   }
@@ -936,13 +1369,22 @@ var ICON = {
   skipped: "[-]",
   failed: "[!]"
 };
+function progressBar(done, total, width = 20) {
+  const pct = total ? Math.round(done / total * 100) : 0;
+  const filled = Math.round(done / total * width);
+  const bar = "\u2588".repeat(filled) + "\u2591".repeat(width - filled);
+  return `[${bar}] ${pct}%`;
+}
 function formatStatus(data) {
   const done = data.tasks.filter((t) => t.status === "done").length;
   const lines = [
     `=== ${data.name} ===`,
-    `\u72B6\u6001: ${data.status} | \u8FDB\u5EA6: ${done}/${data.tasks.length}`,
-    ""
+    `\u72B6\u6001: ${data.status} | \u8FDB\u5EA6: ${progressBar(done, data.tasks.length)} (${done}/${data.tasks.length})`
   ];
+  if (data.activeTaskIds.length) {
+    lines.push(`\u6D3B\u8DC3: ${data.activeTaskIds.join(", ")}`);
+  }
+  lines.push("");
   for (const t of data.tasks) {
     lines.push(`${ICON[t.status] ?? "[ ]"} ${t.id} [${t.type}] ${t.title}${t.summary ? " - " + t.summary : ""}`);
   }
@@ -1009,8 +1451,12 @@ var CLI = class {
       const output = await this.dispatch(args);
       process.stdout.write(output + "\n");
     } catch (e) {
-      process.stderr.write(`\u9519\u8BEF: ${e instanceof Error ? e.message : e}
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`\u9519\u8BEF: ${msg}
 `);
+      if (args.includes("--verbose") && e instanceof Error && e.stack) {
+        process.stderr.write(e.stack + "\n");
+      }
       process.exitCode = 1;
     }
   }
@@ -1081,14 +1527,59 @@ var CLI = class {
       case "resume":
         return await s.resume();
       case "add": {
+        const depsIdx = rest.indexOf("--deps");
+        let deps = [];
+        if (depsIdx !== -1 && rest[depsIdx + 1]) {
+          deps = rest[depsIdx + 1].split(",").map((d) => d.trim()).filter(Boolean);
+          rest.splice(depsIdx, 2);
+        }
+        const descIdx = rest.indexOf("--desc");
+        let desc = "";
+        if (descIdx !== -1 && rest[descIdx + 1]) {
+          desc = rest[descIdx + 1];
+          rest.splice(descIdx, 2);
+        }
         const typeIdx = rest.indexOf("--type");
-        const rawType = typeIdx >= 0 && rest[typeIdx + 1] || "general";
-        const validTypes = /* @__PURE__ */ new Set(["frontend", "backend", "general"]);
-        const type = validTypes.has(rawType) ? rawType : "general";
-        const title = rest.filter((_, i) => i !== typeIdx && i !== typeIdx + 1).join(" ");
-        if (!title) throw new Error("\u9700\u8981\u4EFB\u52A1\u63CF\u8FF0");
-        return await s.add(title, type);
+        let type = "general";
+        if (typeIdx !== -1 && rest[typeIdx + 1]) {
+          type = rest[typeIdx + 1];
+          if (!VALID_TASK_TYPES.has(type)) throw new Error(`\u65E0\u6548\u7684\u7C7B\u578B: ${type}`);
+          rest.splice(typeIdx, 2);
+        }
+        const title = rest.join(" ");
+        if (!title) throw new Error("\u9700\u8981\u4EFB\u52A1\u6807\u9898");
+        return s.add(title, type, desc, deps);
       }
+      case "edit": {
+        const id = rest[0];
+        if (!id) throw new Error("\u9700\u8981\u4EFB\u52A1ID");
+        const updates = {};
+        const titleIdx = rest.indexOf("--title");
+        if (titleIdx !== -1 && rest[titleIdx + 1]) updates.title = rest[titleIdx + 1];
+        const descIdx = rest.indexOf("--desc");
+        if (descIdx !== -1 && rest[descIdx + 1]) updates.description = rest[descIdx + 1];
+        const typeIdx = rest.indexOf("--type");
+        if (typeIdx !== -1 && rest[typeIdx + 1]) {
+          const t = rest[typeIdx + 1];
+          if (!VALID_TASK_TYPES.has(t)) throw new Error(`\u65E0\u6548\u7684\u7C7B\u578B: ${t}\uFF0C\u53EF\u9009: ${[...VALID_TASK_TYPES].join(", ")}`);
+          updates.type = t;
+        }
+        const depsIdx = rest.indexOf("--deps");
+        if (depsIdx !== -1 && rest[depsIdx + 1]) {
+          updates.deps = rest[depsIdx + 1].split(",").map((d) => d.trim()).filter(Boolean);
+        }
+        if (!Object.keys(updates).length) throw new Error("\u81F3\u5C11\u6307\u5B9A\u4E00\u4E2A\u4FEE\u6539\u9879: --title, --desc, --type, --deps");
+        return s.edit(id, updates);
+      }
+      case "show": {
+        const id = rest[0];
+        if (!id) throw new Error("\u9700\u8981\u4EFB\u52A1ID");
+        return s.show(id);
+      }
+      case "log":
+        return s.log();
+      case "pause":
+        return s.pause();
       default:
         return USAGE;
     }
@@ -1099,14 +1590,18 @@ var USAGE = `\u7528\u6CD5: node flow.js <command>
   next [--batch]       \u83B7\u53D6\u4E0B\u4E00\u4E2A\u5F85\u6267\u884C\u4EFB\u52A1 (--batch \u8FD4\u56DE\u6240\u6709\u53EF\u5E76\u884C\u4EFB\u52A1)
   checkpoint <id>      \u8BB0\u5F55\u4EFB\u52A1\u5B8C\u6210 [--file <path> | stdin | \u5185\u8054\u6587\u672C] [--files f1 f2 ...]
   skip <id>            \u624B\u52A8\u8DF3\u8FC7\u4EFB\u52A1
+  edit <id>            \u4FEE\u6539\u4EFB\u52A1 [--title X] [--desc X] [--type X] [--deps 001,002]
+  show <id>            \u67E5\u770B\u4EFB\u52A1\u8BE6\u60C5
+  log                  \u67E5\u770B\u6267\u884C\u5386\u53F2
+  pause                \u6682\u505C\u5DE5\u4F5C\u6D41\uFF08resume \u6062\u590D\uFF09
   review               \u6807\u8BB0code-review\u5DF2\u5B8C\u6210 (finish\u524D\u5FC5\u987B\u6267\u884C)
   finish               \u667A\u80FD\u6536\u5C3E (\u9A8C\u8BC1+\u603B\u7ED3+\u56DE\u5230\u5F85\u547D\uFF0C\u9700\u5148review)
   status               \u67E5\u770B\u5168\u5C40\u8FDB\u5EA6
   resume               \u4E2D\u65AD\u6062\u590D
-  add <\u63CF\u8FF0>           \u8FFD\u52A0\u4EFB\u52A1 [--type frontend|backend|general]`;
+  add <\u63CF\u8FF0>           \u8FFD\u52A0\u4EFB\u52A1 [--type frontend|backend|general] [--desc X] [--deps 001,002]`;
 
 // src/main.ts
 var repo = new FsWorkflowRepository(process.cwd());
-var service = new WorkflowService(repo, parseTasksMarkdown);
+var service = new WorkflowService(repo, repo, repo, parseTasksMarkdown);
 var cli = new CLI(service);
 cli.run(process.argv);
