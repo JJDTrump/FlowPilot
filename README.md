@@ -9,8 +9,11 @@
 
 ## 为什么用 FlowPilot
 
-| 没有 FlowPilot | 有 FlowPilot |
-|----------------|--------------|
+传统 CC 开发：你是项目经理——拆任务、分配、跟进、验收，全程盯着。
+FlowPilot：你是甲方——只说要什么，剩下的全自动。
+
+| 传统 CC 开发 | FlowPilot 开发 |
+|-------------|---------------|
 | 手动拆任务、一个个跟 CC 说 | 说一句需求，自动拆解 10+ 个任务 |
 | 上下文满了要从头来 | 新窗口一句话，从断点继续，零丢失 |
 | 一次只能做一件事 | 多个子Agent并行开发，速度翻倍 |
@@ -31,7 +34,7 @@ CC 自带 Task 工具能派子Agent，但它是**无状态**的——上下文�
 | | 原生 Task | FlowPilot |
 |---|-----------|-----------|
 | 状态持久化 | 对话内，compact 即丢 | 磁盘文件，永不丢失 |
-| 中断恢复 | 从头再来 | `resume` 一键继续 |
+| 中断恢复 | 依赖对话历史，compact 后状态易丢 | 磁盘恢复，`resume` 一键继续 |
 | 并行调度 | 手动安排 | 自动依赖分析，批量派发 |
 | 上下文膨胀 | 主Agent越做越慢 | 三层记忆，主Agent < 100 行 |
 | git 提交 | 手动 | 每个任务自动 commit |
@@ -100,6 +103,16 @@ CC 会自动：拆解任务 → 识别依赖 → 并行派发子Agent → 写代
 ```
 
 所有状态持久化在文件里，不依赖对话历史。哪怕并行执行中 3 个子Agent 同时中断，恢复后全部重新派发。
+
+### 迭代审查 — 跑完一轮再来一轮，越改越好
+
+一轮工作流全自动跑完后，可以再起一轮新的工作流审查上一轮的产出：检查实现是否偏离需求、补漏洞、提升代码质量。全程耗时极短，多迭代几轮也不费事。对比原生使用 CC Agent Teams 手动调度，效率提升显著，性价比极高——省下来的时间，陪陪家人不好吗？
+
+```
+第一轮：需求 → 全自动实现 → 代码产出
+第二轮：审查 → 发现偏离/缺陷 → 自动修补
+第三轮：精修 → 代码质量提升 → 收尾验证
+```
 
 ### 44KB 通吃一切 — 零依赖，复制即用
 
@@ -204,15 +217,15 @@ node flow.js resume               # 中断恢复
 node flow.js add <描述> [--type]  # 追加任务（frontend/backend/general）
 ```
 
-## 执行流程
+## 执行流程（全自动）
 
 ```
 node flow.js init
        ↓
-  生成 CLAUDE.md 协议嵌入 + 环境检测
+  协议嵌入 CLAUDE.md + Hooks 注入
        ↓
   用户描述需求 / 丢入开发文档
-       ↓
+       ↓                          ← 以下全自动，无需人工介入
   ┌─→ flow next (--batch) ──→ 获取任务+上下文
   │        ↓
   │   子Agent执行（自动选插件）
@@ -221,11 +234,11 @@ node flow.js init
   │        ↓
   └── 还有任务？──→ 是 → 循环
                    否 ↓
-              code-review ──→ flow review
-                   ↓
               flow finish ──→ build/test/lint
                    ↓
-              回到 idle，等下一个需求
+              code-review ──→ flow review
+                   ↓
+              flow finish ──→ 最终提交 → 清理 .workflow/ → idle
 ```
 
 ## 错误处理
@@ -253,12 +266,10 @@ src/
 ├── domain/
 │   ├── types.ts                     # TaskEntry, ProgressData 等类型
 │   ├── task-store.ts                # 任务状态管理（纯函数）
-│   └── workflow.ts                  # WorkflowDefinition 定义
+│   ├── workflow.ts                  # WorkflowDefinition 定义
+│   └── repository.ts               # 仓储接口
 ├── application/
 │   └── workflow-service.ts          # 核心用例（11个）
-├── domain/
-│   ├── ...
-│   └── repository.ts                # 仓储接口
 ├── infrastructure/
 │   ├── fs-repository.ts             # 文件系统实现 + CLAUDE.md协议嵌入 + Hooks注入
 │   ├── markdown-parser.ts           # 任务Markdown解析
