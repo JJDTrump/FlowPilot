@@ -2,7 +2,7 @@
 
 ## 这是什么
 
-一个 38KB 的单文件工具，让 Claude Code 变成全自动开发机器。
+一个 44KB 的单文件工具，让 Claude Code 变成全自动开发机器。
 复制一个文件到项目里，说一句"开始"，它就会自动拆解需求、分配任务、写代码、提交 git、跑测试，直到全部完成。
 
 ## 前置条件
@@ -10,12 +10,11 @@
 - Node.js >= 20
 - Claude Code (CC) 已安装
 - **必须开启 Agent Teams 功能**：
-  - 路径：Claude Code → Settings → Feature Flags → Agent Teams → 开启
+  - 在 `~/.claude/settings.json` 中添加 `"env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }`
   - 这是核心依赖，未开启则无法派发子Agent执行任务
 - **建议先安装插件**（未安装则子Agent功能降级）：
   在 CC 中执行 `/plugin` 打开插件商店，选择安装：
-  `superpowers`、`frontend-design`、`feature-dev`、`code-review`
-- 推荐配置 **context7 MCP**（子Agent查询官方文档）：在 `~/.claude/mcp.json` 中添加
+  `superpowers`、`frontend-design`、`feature-dev`、`code-review`、`context7`
 
 ## 快速开始
 
@@ -71,7 +70,7 @@ CC：（自动拆解为 10+ 个任务，按依赖顺序逐个执行）
 ```bash
 cd 已有项目
 node flow.js init    # 接管项目
-# 开CC，说"开始"
+# 开CC，描述开发需求
 你：给现有系统加一个搜索功能
 ```
 
@@ -146,7 +145,7 @@ CC：恢复工作流: 博客系统 | 进度: 7/12 | 继续执行
 ## 工作原理
 
 ```
-用户说"开始"
+用户描述开发需求
     ↓
 CC 读 CLAUDE.md → 发现嵌入协议 → 进入调度模式
     ↓
@@ -269,7 +268,7 @@ flow finish → 自动跑 build/test/lint → 汇报完成/跳过/失败项 → 
 
 恢复流程：
 ```
-新窗口 → 说"开始" → flow resume
+新窗口 → 说：继续任务 → flow resume
   ↓
 检测到3个active任务 → 全部重置为pending
   ↓
@@ -302,10 +301,10 @@ flow next --batch → 重新并行派发这3个任务
 ## 常见问题
 
 **Q: Agent Teams 没开启会怎样？**
-协议会要求 CC 立即停止并提示你开启。路径：Settings → Feature Flags → Agent Teams。
+协议会要求 CC 立即停止并提示你开启。在 `~/.claude/settings.json` 中添加 `"env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }`。
 
 **Q: 上下文满了怎么办？**
-CC 自动 compact 后，说"开始"即可恢复。所有状态都在文件里，不依赖对话历史。
+CC 自动 compact 后，说"继续任务"即可恢复。所有状态都在文件里，不依赖对话历史。
 
 **Q: 任务失败了怎么办？**
 自动重试 3 次。3 次都失败则跳过，继续下一个。finish 收尾时会汇报所有跳过和失败的任务。
