@@ -39,7 +39,7 @@ export class CLI {
         } else {
           out = await s.setup();
         }
-        return out + '\n\n提示: 建议先通过 /plugin 安装插件 superpowers、frontend-design、feature-dev、code-review，未安装则子Agent无法使用专业技能，功能会降级';
+        return out + '\n\n提示: 建议先通过 /plugin 安装插件 superpowers、frontend-design、feature-dev、code-review、context7，未安装则子Agent无法使用专业技能，功能会降级';
       }
 
       case 'next': {

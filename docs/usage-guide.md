@@ -1,5 +1,7 @@
 # FlowPilot - 使用说明
 
+[English](usage-guide.en.md)
+
 ## 这是什么
 
 一个 44KB 的单文件工具，让 Claude Code 变成全自动开发机器。

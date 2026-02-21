@@ -1,5 +1,7 @@
 # FlowPilot
 
+[English](README.en.md)
+
 **一个文件，一句开发需求，全自动开发。**
 
 把 `flow.js` 丢进任何项目，打开 Claude Code 描述你要做什么，然后去喝杯咖啡。

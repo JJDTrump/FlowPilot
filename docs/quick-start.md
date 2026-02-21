@@ -1,5 +1,7 @@
 # FlowPilot 快速上手
 
+[English](quick-start.en.md)
+
 > 不需要懂原理，照着做就行。
 
 ## 准备工作（只做一次）
